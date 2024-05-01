@@ -2,7 +2,6 @@
 #include <boost/asio/steady_timer.hpp>
 #include <saber/component_collector.hpp>
 
-
 namespace saber {
 ComponentCollector::ComponentCollector(
 	ekizu::ComponentType component_type,
@@ -37,13 +36,20 @@ void ComponentCollector::async_send(const ekizu::Interaction& interaction,
 									const boost::asio::yield_context& yield) {
 	if (!interaction.data) { return; }
 
-	const auto* data =
-		std::get_if<ekizu::MessageComponentData>(&*interaction.data);
+	std::visit(
+		[this, &interaction, &yield](const auto& data) {
+			using T = std::decay_t<decltype(data)>;
 
-	if (data != nullptr && data->type != m_component_type) { return; }
-	if (m_filter && !m_filter(interaction, *data)) { return; }
+			if constexpr (std::is_same_v<T, ekizu::MessageComponentData>) {
+				if (data.type != m_component_type ||
+					(m_filter && !m_filter(interaction, data))) {
+					return;
+				}
 
-	m_on_collect_chan.async_send(
-		boost::system::error_code{}, &interaction, data, yield);
+				m_on_collect_chan.async_send(
+					boost::system::error_code{}, &interaction, &data, yield);
+			}
+		},
+		*interaction.data);
 }
 }  // namespace saber
