@@ -72,8 +72,8 @@ jobs:
         id: vcpkg
         with:
           manifest-dir: ${{ github.workspace }}
-          triplet: ${{ runner.os == 'Windows' && format('{0}-windows-release', matrix.config.arch) || 'x64-linux-release' }}
-          cache-key: ${{ runner.os }}-${{ matrix.config.arch }}-release-vcpkg
+          triplet: ${{ runner.os == 'Windows' && matrix.config.arch == 'x64' && 'x64-windows-release' || runner.os == 'Windows' && 'x86-windows' || 'x64-linux' }}
+          cache-key: ${{ runner.os }}-${{ matrix.config.arch }}-${{ runner.os == 'Windows' && matrix.config.arch == 'x64' && 'x64-windows-release' || runner.os == 'Windows' && 'x86-windows' || 'x64-linux' }}-vcpkg
           token: ${{ github.token }}
 
       - name: Add MSBuild to PATH (Windows)
