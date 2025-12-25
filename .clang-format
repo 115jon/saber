@@ -12,3 +12,4 @@ AllowShortCaseLabelsOnASingleLine: true
 SortIncludes: true
 SortUsingDeclarations: true
 PenaltyIndentedWhitespace: 1
+PointerAlignment: Right
