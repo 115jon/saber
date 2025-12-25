@@ -3,6 +3,8 @@
 
 using namespace saber;
 
+static constexpr std::string_view api_url = "https://xkcd.com/info.0.json";
+
 struct XKCD : Command {
 	explicit XKCD(Saber &creator)
 		: Command(creator,
@@ -22,13 +24,11 @@ struct XKCD : Command {
 	}
 
    private:
-	std::string api_url{"https://xkcd.com{}info.0.json"};
-
 	Result<> fetchXKCD(const ekizu::Message &message,
 					   [[maybe_unused]] const std::vector<std::string> &args,
 					   const boost::asio::yield_context &yield) {
 		auto res = ekizu::net::HttpConnection::get(
-			api_url.replace(api_url.find("{}"), 2, "/"), yield);
+			bot.http().get_executor(), api_url, yield);
 
 		if (!res || res.value().result_int() != 200) {
 			bot.log<ekizu::LogLevel::Error>("Error while fetching XKCD data");
@@ -51,7 +51,8 @@ struct XKCD : Command {
 			return boost::system::errc::invalid_argument;
 		}
 
-		const auto comic_url = fmt::format("https://xkcd.com/{}", json["num"]);
+		const auto comic_url =
+			fmt::format("https://xkcd.com/{}", json["num"].get<uint32_t>());
 		const auto msg = fmt::format(
 			"**{}**\n{}\nAlt Text:```{}```XKCD Link: <{}>",
 			json["safe_title"].get<std::string>(),

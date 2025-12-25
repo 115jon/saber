@@ -16,10 +16,11 @@ overload(Func...) -> overload<Func...>;
 }  // namespace
 
 namespace saber {
-Saber::Saber(Config config)
+Saber::Saber(boost::asio::io_context &ctx, Config config)
 	: m_commands{*this},
-	  m_http{config.token},
-	  m_shard{ekizu::ShardId::ONE, config.token, ekizu::Intents::AllIntents},
+	  m_http{ctx.get_executor(), config.token},
+	  m_shard{ctx.get_executor(), ekizu::ShardId::ONE, config.token,
+			  ekizu::Intents::AllIntents},
 	  m_config{std::move(config)},
 	  m_player{[this](ekizu::Snowflake guild_id, ekizu::Snowflake channel_id,
 					  const boost::asio::yield_context &yield) {
@@ -61,7 +62,7 @@ Saber::Saber(Config config)
 
 	console_sink->set_level(level);
 
-	m_shard.attach_logger([this](const ekizu::Log &log) {
+	auto log_fn = [this](const ekizu::Log &log) {
 		switch (log.level) {
 			case ekizu::LogLevel::Info: m_logger->info(log.message); break;
 			case ekizu::LogLevel::Warn: m_logger->warn(log.message); break;
@@ -72,7 +73,10 @@ Saber::Saber(Config config)
 				m_logger->critical(log.message);
 				break;
 		}
-	});
+	};
+
+	m_player.attach_logger(log_fn);
+	m_shard.attach_logger(log_fn);
 
 	m_logger = spdlog::logger{"saber", {console_sink, file_sink}};
 	m_logger->set_level(level);
@@ -132,7 +136,7 @@ Result<> Saber::leave_voice_channel(ekizu::Snowflake guild_id,
 	return m_shard.leave_voice_channel(guild_id, yield);
 }
 
-ComponentCollector &Saber::create_message_component_collector(
+std::shared_ptr<ComponentCollector> Saber::create_message_component_collector(
 	ekizu::Snowflake channel_id,
 	std::function<bool(const ekizu::Interaction &,
 					   const ekizu::MessageComponentData &)>
@@ -140,33 +144,107 @@ ComponentCollector &Saber::create_message_component_collector(
 	ekizu::ComponentType component_type,
 	std::chrono::steady_clock::duration expiry,
 	const boost::asio::yield_context &yield) {
-	return m_collectors[channel_id].emplace_back(
+	auto &list = m_collectors[channel_id];
+
+	// LAZY CLEANUP: Remove collectors that have finished (timer expired or
+	// closed) This prevents the vector from growing infinitely.
+	list.erase(
+		std::remove_if(list.begin(), list.end(),
+					   [](const std::shared_ptr<ComponentCollector> &ptr) {
+						   return ptr->is_finished();
+					   }),
+		list.end());
+
+	// 1. Allocate on Heap
+	// Using shared_ptr ensures the ComponentCollector object stays at a
+	// fixed memory address even if the vector 'list' resizes.
+	auto collector = std::make_shared<ComponentCollector>(
 		component_type, expiry, std::move(filter), yield);
+
+	// 2. Add to vector
+	list.push_back(collector);
+
+	return collector;
 }
 
 void Saber::run(const boost::asio::yield_context &yield) {
 	m_commands.load_all(yield);
 
-	while (true) {
-		auto res = m_shard.next_event(yield);
+	boost::system::error_code ec;
+	while (m_running) {
+		auto res = m_shard.next_event(yield[ec]);
+
+		if (ec == boost::asio::error::operation_aborted) {
+			log<ekizu::LogLevel::Info>("Run loop cancelled by stop signal");
+			break;
+		}
 
 		if (!res) {
-			if (res.error().failed()) {
+			if (m_running && res.error().failed()) {
 				fmt::println(
 					"Failed to get next event: {}", res.error().message());
 				return;
 			}
-			// Could be handling a non-dispatch event.
 			continue;
 		}
 
 		boost::asio::spawn(
-			yield,
-			[this, e = std::move(res.value())](auto y) { handle_event(e, y); },
+			m_shard.get_executor(),
+			[this, ev = std::move(res.value())](const auto &y) {
+				handle_event(ev, y);
+			},
 			boost::asio::detached);
 	}
 
-	spdlog::shutdown();
+	// Only try to close gracefully if we're not in forced shutdown
+	if (m_running) {
+		if (auto res = m_shard.close(ekizu::CloseFrame::NORMAL, yield); !res) {
+			log<ekizu::LogLevel::Warn>(
+				"Gateway close error: {}", res.error().message());
+		}
+	}
+
+	log<ekizu::LogLevel::Info>("Bot run loop exited");
+}
+
+Result<> Saber::stop(const boost::asio::yield_context &yield) {
+	log<ekizu::LogLevel::Info>("Initiating shutdown sequence...");
+
+	// Step 1: Set running flag to false
+	m_running = false;
+
+	// 1) Try to close gateway gracefully and WAIT for completion.
+	// This avoids returning while IOCP operations are still active.
+	{
+		boost::system::error_code ec;
+		auto r = m_shard.close(ekizu::CloseFrame::NORMAL, yield[ec]);
+		if (ec) {
+			log<ekizu::LogLevel::Warn>(
+				"Shard close aborted/error: {}", ec.message());
+		} else if (!r) {
+			log<ekizu::LogLevel::Warn>(
+				"Shard close returned error: {}", r.error().message());
+		}
+	}
+
+	m_http.shutdown();
+
+	// Step 3: Shutdown collectors (cancels pending waits)
+	log<ekizu::LogLevel::Debug>(
+		"Shutting down {} collector groups", m_collectors.size());
+	for (auto &[channel_id, collectors] : m_collectors) {
+		for (auto &collector : collectors) {
+			if (collector) { collector->shutdown(); }
+		}
+	}
+	m_collectors.clear();
+
+	// Step 4: Shutdown player (most critical - involves voice connections)
+	log<ekizu::LogLevel::Debug>("Shutting down player");
+	m_player.shutdown();
+
+	log<ekizu::LogLevel::Info>("Shutdown complete");
+	return outcome::success();
 }
 
 void Saber::handle_event(ekizu::Event ev,
@@ -194,10 +272,27 @@ void Saber::handle_event(ekizu::Event ev,
 					m_voice_state_cache.put(g.guild.id, std::move(lru));
 				}
 			},
-			[this, &yield](const ekizu::InteractionCreate &i) {
-				for (auto &collector :
-					 m_collectors[*i.interaction.channel_id]) {
-					collector.async_send(i.interaction, yield);
+			[this, &yield](const ekizu::InteractionCreate &payload) {
+				const auto &interaction = payload.interaction;
+				if (!interaction.channel_id) { return; }
+
+				std::vector<std::shared_ptr<ComponentCollector>>
+					local_collectors;
+
+				// 1. Quick synchronous copy to avoid holding the map/vector
+				// lock during yield
+				if (auto it = m_collectors.find(*interaction.channel_id);
+					it != m_collectors.end()) {
+					local_collectors = it->second;	// Copy shared_ptrs (cheap)
+				}
+
+				// 2. Iterate the LOCAL copy.
+				// Even if m_collectors rehashes or vector resizes,
+				// 'local_collectors' is stable.
+				for (const auto &collector : local_collectors) {
+					if (!collector->is_finished()) {
+						collector->async_send(interaction, yield);
+					}
 				}
 			},
 			[this](const ekizu::VoiceStateUpdate &v) {
@@ -238,10 +333,7 @@ void Saber::handle_event(ekizu::Event ev,
 				};
 			},
 			[this](ekizu::Resumed) { log<ekizu::LogLevel::Info>("Resumed"); },
-			[this](const auto &e) {
-				log<ekizu::LogLevel::Warn>(
-					"Unhandled event: {}", typeid(e).name());
-			}},
+			[](const auto & /*e*/) {}},
 		ev);
 }
 }  // namespace saber

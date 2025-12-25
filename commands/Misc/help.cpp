@@ -104,17 +104,17 @@ struct Help : Command {
 			return data.custom_id == "help_menu" && id == author_id;
 		};
 
-		auto &collector = bot.create_message_component_collector(
+		auto collector = bot.create_message_component_collector(
 			message.channel_id, filter, ekizu::ComponentType::SelectMenu,
 			std::chrono::seconds(30), yield);
 
 		while (true) {
-			auto res = collector.async_receive(yield);
+			auto res = collector->async_receive(yield);
 			if (!res) { break; }
 
-			auto [i, data] = res.value();
+			auto &[i, data] = res.value();
 
-			const auto &values = data->values;
+			const auto &values = data.values;
 			if (values.empty()) { continue; }
 
 			const auto &category = values[0];
@@ -134,9 +134,9 @@ struct Help : Command {
 
 			SABER_TRY(
 				bot.http()
-					.interaction(i->application_id)
+					.interaction(i.application_id)
 					.create_response(
-						i->id, i->token,
+						i.id, i.token,
 						ekizu::InteractionResponseBuilder()
 							.embeds({builder.build()})
 							.type(ekizu::InteractionResponseType::UpdateMessage)
@@ -164,10 +164,11 @@ struct Help : Command {
 			[&, this](const boost::unordered_flat_map<
 					  std::string, std::shared_ptr<Command>> &commands) {
 				if (!commands.contains(command)) {
-					return (void)bot.http()
+					(void)bot.http()
 						.create_message(message.channel_id)
 						.content("Command not found.")
 						.send(yield);
+					return;
 				}
 
 				const auto &cmd = commands.at(command);

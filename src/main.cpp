@@ -13,16 +13,30 @@ int main() {
 		return boost::system::errc::invalid_argument;
 	}
 
-	auto saber = saber::Saber{config.value()};
+	auto saber = saber::Saber{ctx, config.value()};
 
-	spawn(
-		ctx, [&saber](auto y) { saber.run(y); }, boost::asio::detached);
+	boost::asio::spawn(
+		ctx, [&saber](const auto &y) { saber.run(y); }, boost::asio::detached);
 
-	// TODO: Implement graceful shutdown
+	// Handle shutdown signals
 	boost::asio::signal_set signals(ctx, SIGINT, SIGTERM);
-	signals.async_wait([&ctx](const boost::system::error_code& ec, int) {
-		if (!ec) { ctx.stop(); }
-	});
+	signals.async_wait(
+		[&](const boost::system::error_code &ec, int /* signal_number */) {
+			if (ec) { return; }
+
+			// Run an orderly async shutdown that can wait for shard.close() to
+			// complete.
+			boost::asio::spawn(
+				ctx,
+				[&saber](const boost::asio::yield_context &y) {
+					boost::ignore_unused(saber.stop(y));
+				},
+				boost::asio::detached);
+
+			// Prevent re-entry if multiple signals arrive.
+			boost::system::error_code ignored;
+			signals.cancel(ignored);
+		});
 
 	ctx.run();
 }

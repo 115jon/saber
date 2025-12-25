@@ -29,7 +29,7 @@ struct Meme : Command {
 	Result<> fetch_meme(const ekizu::Message &message,
 						const boost::asio::yield_context &yield) const {
 		auto res = ekizu::net::HttpConnection::get(
-			"https://meme-api.com/gimme", yield);
+			bot.http().get_executor(), "https://meme-api.com/gimme", yield);
 
 		if (!res) { return boost::system::errc::operation_not_permitted; }
 

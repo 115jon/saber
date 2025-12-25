@@ -1,0 +1,26 @@
+{
+  "dependencies": [
+    "boost-asio",
+    "boost-beast",
+    "boost-charconv",
+    "boost-coroutine2",
+    "boost-filesystem",
+    "boost-process",
+    "boost-scope-exit",
+    "boost-outcome",
+    "boost-url",
+    "fmt",
+    {
+      "name": "libdave",
+      "features": ["disable-logging"]
+    },
+    "libsodium",
+    "nlohmann-json",
+    "openssl",
+    "opus",
+    "opusfile",
+    "portaudio",
+    "spdlog",
+    "zlib"
+  ]
+}

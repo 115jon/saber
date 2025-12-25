@@ -1,0 +1,3 @@
+[submodule "extern/ekizu"]
+	path = extern/ekizu
+	url = https://github.com/115jon/ekizu.git

@@ -1,4 +1,5 @@
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <boost/beast/core/detail/base64.hpp>
 #include <boost/url/encode.hpp>
@@ -7,8 +8,8 @@
 #include <saber/reddit.hpp>
 
 namespace {
-constexpr const char* API_HOST = "oauth.reddit.com";
-constexpr const char* ACCESS_TOKEN_PATH = "/api/v1/access_token";
+constexpr const char *API_HOST = "oauth.reddit.com";
+constexpr const char *ACCESS_TOKEN_PATH = "/api/v1/access_token";
 
 std::string base64_encode(std::string_view str) {
 	std::string ret(
@@ -17,11 +18,11 @@ std::string base64_encode(std::string_view str) {
 	return ret;
 }
 
-std::string to_query_string(const saber::RedditFields& fields) {
+std::string to_query_string(const saber::RedditFields &fields) {
 	std::vector<std::string> query_elements;
 
 	auto add_query_param =
-		[&query_elements](const std::string& key, const auto& opt_value) {
+		[&query_elements](const std::string &key, const auto &opt_value) {
 			if (opt_value) {
 				query_elements.push_back(fmt::format(
 					"{}={}", key,
@@ -43,96 +44,189 @@ std::string to_query_string(const saber::RedditFields& fields) {
 		fields.subreddit ? fmt::format("/r/{}", fields.subreddit.value()) : "",
 		fmt::join(query_elements, "&"));
 }
+
 }  // namespace
 
 namespace saber {
 
-Result<net::HttpResponse> GetReddit::send(
-	const boost::asio::yield_context& yield) {
-	if (!m_make_request) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	return m_make_request(to_query_string(m_fields), yield);
+std::string GetReddit::m_build_path() const {
+	return to_query_string(m_fields);
 }
 
-GetReddit::GetReddit(
-	std::function<Result<net::HttpResponse>(
-		std::string_view path, const boost::asio::yield_context& yield)>
-		make_request)
-	: m_make_request{std::move(make_request)} {}
+Reddit::Reddit(asio::any_io_executor ex, RedditOptions options)
+	: m_ex{std::move(ex)}, m_options{std::move(options)} {}
 
-Reddit::Reddit(RedditOptions options) : m_options{std::move(options)} {}
+GetReddit Reddit::get() {
+	return GetReddit(GetReddit::MakeRequestFn{
+		[this](
+			std::string path,
+			asio::any_completion_handler<void(Result<net::HttpResponse>)> h) {
+			asio::dispatch(m_ex, [this, path = std::move(path),
+								  h = std::move(h)]() mutable {
+				get_token_async(asio::any_completion_handler<
+								void(Result<std::string>)>{asio::bind_executor(
+					m_ex, [this, path = std::move(path),
+						   h = std::move(h)](Result<std::string> tok) mutable {
+						if (!tok) {
+							std::move(h)(tok.error());
+							return;
+						}
 
-SABER_EXPORT GetReddit Reddit::get() {
-	return GetReddit(
-		[this](std::string_view path, const boost::asio::yield_context& yield)
-			-> Result<net::HttpResponse> {
-			SABER_TRY(get_token(yield));
-			net::HttpRequest req{net::HttpMethod::get, path, 11};
-			req.set(net::http::field::authorization, m_token);
-			req.set(net::http::field::host, API_HOST);
-			req.set(net::http::field::user_agent, "insomnia/8.4.5");
-			req.prepare_payload();
-			return request(req, yield);
-		});
+						net::HttpRequest req{net::HttpMethod::get, path, 11};
+						req.set(net::http::field::authorization, tok.value());
+						req.set(net::http::field::host, API_HOST);
+						req.set(net::http::field::user_agent, "insomnia/8.4.5");
+						req.prepare_payload();
+
+						request_async(std::move(req), std::move(h));
+					})});
+			});
+		}});
 }
 
-Result<net::HttpResponse> Reddit::request(
-	const net::HttpRequest& req, const boost::asio::yield_context& yield) {
-	if (!m_http) {
-		SABER_TRY(auto http, net::HttpConnection::connect(
-								 "https://www.reddit.com", yield));
-		m_http = std::move(http);
-	}
+void Reddit::request_async(
+	net::HttpRequest req,
+	asio::any_completion_handler<void(Result<net::HttpResponse>)> handler) {
+	asio::dispatch(m_ex, [this, req = std::move(req),
+						  h = std::move(handler)]() mutable {
+		struct Attempt : std::enable_shared_from_this<Attempt> {
+			Reddit *self{};
+			net::HttpRequest req;
+			int attempt{};
+			asio::any_completion_handler<void(Result<net::HttpResponse>)>
+				handler;
 
-	if (auto res = m_http->request(req, yield); res) { return res; }
+			Attempt(
+				Reddit *s, net::HttpRequest r, int a,
+				asio::any_completion_handler<void(Result<net::HttpResponse>)> h)
+				: self{s},
+				  req{std::move(r)},
+				  attempt{a},
+				  handler{std::move(h)} {}
 
-	SABER_TRY(auto http,
-			  net::HttpConnection::connect("https://www.reddit.com", yield));
-	m_http = std::move(http);
+			void start() {
+				if (self->m_http) {
+					do_request();
+					return;
+				}
 
-	return m_http->request(req, yield);
+				net::HttpConnection::connect(
+					self->m_ex, "https://www.reddit.com",
+					asio::bind_executor(
+						self->m_ex,
+						[me = shared_from_this()](
+							Result<net::HttpConnection> conn) mutable {
+							if (!conn) {
+								std::move(me->handler)(conn.error());
+								return;
+							}
+							me->self->m_http = std::move(conn.value());
+							me->do_request();
+						}));
+			}
+
+			void do_request() {
+				// Keep a copy for one retry (HttpRequest is copyable).
+				net::HttpRequest original = req;
+
+				self->m_http->request(
+					std::move(req),
+					asio::bind_executor(
+						self->m_ex, [me = shared_from_this(),
+									 original = std::move(original)](
+										Result<net::HttpResponse> res) mutable {
+							if (res) {
+								std::move(me->handler)(std::move(res));
+								return;
+							}
+
+							if (me->attempt >= 1) {
+								std::move(me->handler)(res.error());
+								return;
+							}
+
+							// Retry once: reconnect then resend the same
+							// request.
+							me->self->m_http.reset();
+							me->attempt += 1;
+							me->req = std::move(original);
+							me->start();
+						}));
+			}
+		};
+
+		std::make_shared<Attempt>(this, std::move(req), 0, std::move(h))
+			->start();
+	});
 }
 
-Result<std::string> Reddit::get_token(const boost::asio::yield_context& yield) {
-	// If our access token is still valid, we can return it.
-	if (std::chrono::system_clock::now() < m_token_expiration) {
-		return m_token;
-	}
+void Reddit::get_token_async(
+	asio::any_completion_handler<void(Result<std::string>)> handler) {
+	asio::dispatch(m_ex, [this, h = std::move(handler)]() mutable {
+		if (std::chrono::system_clock::now() < m_token_expiration &&
+			!m_token.empty()) {
+			std::move(h)(m_token);
+			return;
+		}
 
-	net::HttpRequest req{
-		net::HttpMethod::post,
-		fmt::format("{}?grant_type=password&username={}&password={}",
-					ACCESS_TOKEN_PATH, m_options.username, m_options.password),
-		11};
-	const auto authorization = fmt::format(
-		"Basic {}", base64_encode(fmt::format(
-						"{}:{}", m_options.app_id, m_options.app_secret)));
+		net::HttpRequest req{
+			net::HttpMethod::post,
+			fmt::format(
+				"{}?grant_type=password&username={}&password={}",
+				ACCESS_TOKEN_PATH, m_options.username, m_options.password),
+			11};
 
-	req.set(net::http::field::authorization, authorization);
-	req.set(net::http::field::host, "www.reddit.com");
-	req.set(net::http::field::user_agent, "insomnia/8.4.5");
-	req.prepare_payload();
+		const auto authorization = fmt::format(
+			"Basic {}", base64_encode(fmt::format(
+							"{}:{}", m_options.app_id, m_options.app_secret)));
 
-	SABER_TRY(auto res, request(req, yield));
+		req.set(net::http::field::authorization, authorization);
+		req.set(net::http::field::host, "www.reddit.com");
+		req.set(net::http::field::user_agent, "insomnia/8.4.5");
+		req.prepare_payload();
 
-	if (res.result() != net::http::status::ok) {
-		return boost::system::errc::invalid_argument;
-	}
+		request_async(
+			std::move(req),
+			asio::any_completion_handler<void(Result<net::HttpResponse>)>{
+				asio::bind_executor(
+					m_ex, [this, h = std::move(h)](
+							  Result<net::HttpResponse> res) mutable {
+						if (!res) {
+							std::move(h)(res.error());
+							return;
+						}
 
-	SABER_TRY(auto data, ekizu::json_util::try_parse(res.body()));
+						if (res.value().result() != net::http::status::ok) {
+							std::move(h)(boost::system::errc::invalid_argument);
+							return;
+						}
 
-	if (!ekizu::json_util::not_null_all(data, "token_type", "access_token")) {
-		return boost::system::errc::invalid_argument;
-	}
+						auto data =
+							ekizu::json_util::try_parse(res.value().body());
+						if (!data) {
+							std::move(h)(data.error());
+							return;
+						}
 
-	m_token = fmt::format("{} {}", data["token_type"].get<std::string>(),
-						  data["access_token"].get<std::string>());
-	m_token_expiration =
-		std::chrono::system_clock::now() +
-		std::chrono::seconds(data["expires_in"].get<uint32_t>());
+						if (!ekizu::json_util::not_null_all(
+								data.value(), "token_type", "access_token") ||
+							!data.value().contains("expires_in")) {
+							std::move(h)(boost::system::errc::invalid_argument);
+							return;
+						}
 
-	return m_token;
+						m_token = fmt::format(
+							"{} {}",
+							data.value()["token_type"].get<std::string>(),
+							data.value()["access_token"].get<std::string>());
+
+						m_token_expiration =
+							std::chrono::system_clock::now() +
+							std::chrono::seconds(
+								data.value()["expires_in"].get<int64_t>());
+
+						std::move(h)(m_token);
+					})});
+	});
 }
 }  // namespace saber

@@ -23,7 +23,7 @@ struct Countdown : Command {
 		const std::vector<std::string> countdown{
 			"five", "four", "three", "two", "one"};
 
-		boost::asio::deadline_timer timer{yield.get_executor()};
+		boost::asio::steady_timer timer{yield.get_executor()};
 
 		for (const auto &num : countdown) {
 			SABER_TRY(bot.http()
@@ -31,8 +31,10 @@ struct Countdown : Command {
 						  .content(fmt::format("**:{}:**", num))
 						  .send(yield));
 
-			timer.expires_from_now(boost::posix_time::seconds(1));
-			timer.async_wait(yield);
+			boost::system::error_code ec;
+			timer.expires_after(std::chrono::seconds(1));
+			timer.async_wait(yield[ec]);
+			if (ec) { return ec; }
 		}
 
 		SABER_TRY(bot.http()

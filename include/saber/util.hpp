@@ -1,6 +1,7 @@
 #ifndef SABER_UTIL_HPP
 #define SABER_UTIL_HPP
 
+#include <random>
 #include <saber/saber.hpp>
 
 namespace saber::util {

@@ -1,16 +1,11 @@
 #ifndef SABER_COMMANDS_HPP
 #define SABER_COMMANDS_HPP
 
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <ekizu/message.hpp>
 #include <ekizu/permissions.hpp>
-// For the DIRNAME macro.
-#include <boost/core/span.hpp>
-#include <boost/unordered/unordered_flat_map.hpp>
-#include <chrono>
-#include <filesystem>
-#include <mutex>
+#include <filesystem>  // NOLINT
 #include <saber/library.hpp>
-#include <vector>
 
 namespace saber {
 struct Command;
@@ -30,29 +25,33 @@ struct CommandLoader {
 
 	SABER_EXPORT void load(std::string_view path,
 						   const boost::asio::yield_context &yield);
+
 	SABER_EXPORT void load_all(const boost::asio::yield_context &yield);
-	SABER_EXPORT Result<> process_commands(
+
+	[[nodiscard]] SABER_EXPORT Result<> process_commands(
 		const ekizu::Message &message, const boost::asio::yield_context &yield);
+
 	SABER_EXPORT void unload(const std::string &name);
+
 	SABER_EXPORT void get_commands(
 		ekizu::FunctionView<void(const boost::unordered_flat_map<
-								 std::string, std::shared_ptr<Command> > &)>)
+								 std::string, std::shared_ptr<Command>> &)>)
 		const;
 
    private:
 	mutable std::mutex m_mtx;
 	Saber &m_parent;
 	boost::unordered_flat_map<std::string, Library> commands;
-	boost::unordered_flat_map<std::string, std::shared_ptr<Command> >
+	boost::unordered_flat_map<std::string, std::shared_ptr<Command>>
 		command_map;
-	boost::unordered_flat_map<std::string, std::shared_ptr<Command> > alias_map;
-	boost::unordered_flat_map<std::string, std::shared_ptr<Command> >
+	boost::unordered_flat_map<std::string, std::shared_ptr<Command>> alias_map;
+	boost::unordered_flat_map<std::string, std::shared_ptr<Command>>
 		slash_commands;
-	boost::unordered_flat_map<std::string, std::shared_ptr<Command> >
+	boost::unordered_flat_map<std::string, std::shared_ptr<Command>>
 		user_commands;
 	boost::unordered_flat_map<
 		std::string, boost::unordered_flat_map<
-						 std::string, std::chrono::steady_clock::time_point> >
+						 std::string, std::chrono::steady_clock::time_point>>
 		cooldowns;
 };
 
@@ -64,7 +63,7 @@ struct CommandOptions {
 	bool guild_only{};
 	bool slash{};
 	bool user{};
-	// std::optional<std::vector<ekizu::ApplicationCommandOption> > options;
+	// std::optional<std::vector<ApplicationCommandOption>> options;
 	std::vector<std::string> aliases;
 	std::string usage;
 	std::string description;
@@ -73,8 +72,8 @@ struct CommandOptions {
 	bool nsfw{};
 	bool owner_only{};
 	std::chrono::steady_clock::duration cooldown;
-	std::vector<std::string> examples{};
-	std::string subcommands{};
+	std::vector<std::string> examples;
+	std::string subcommands;
 	bool activity{};
 	bool voice_only{};
 };
@@ -153,8 +152,9 @@ struct CommandOptionsBuilder {
 		return *this;
 	}
 
-	template <typename... T>
-	CommandOptionsBuilder &cooldown(std::chrono::duration<T...> cooldown) {
+	template <typename Rep, typename Period>
+	CommandOptionsBuilder &cooldown(
+		std::chrono::duration<Rep, Period> cooldown) {
 		m_options.cooldown = cooldown;
 		return *this;
 	}
@@ -190,13 +190,11 @@ struct Command {
 		// JSON data.
 		if (options.slash) {
 			// slash_data.name = options.name;
-
 			// if (!options.description.empty()) {
-			// 	slash_data.description = options.description;
+			//     slash_data.description = options.description;
 			// }
-
 			// if (options.options.has_value() && !options.options->empty()) {
-			// 	slash_data.options = options.options;
+			//     slash_data.options = options.options;
 			// }
 		}
 	};
@@ -208,15 +206,15 @@ struct Command {
 	virtual ~Command() = default;
 
 	/// Method reserved for any initial setup for the command.
-	virtual Result<> setup(
+	[[nodiscard]] virtual Result<> setup(
 		[[maybe_unused]] const boost::asio::yield_context &yield) {
 		return ekizu::outcome::success();
 	}
 
 	/// Method reserved for message commands' execution.
-	virtual Result<> execute(const ekizu::Message &message,
-							 const std::vector<std::string> &args,
-							 const boost::asio::yield_context &yield) = 0;
+	[[nodiscard]] virtual Result<> execute(
+		const ekizu::Message &message, const std::vector<std::string> &args,
+		const boost::asio::yield_context &yield) = 0;
 
 	Saber &bot;
 	CommandOptions options;

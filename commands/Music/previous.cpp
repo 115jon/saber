@@ -24,7 +24,9 @@ struct Previous : Command {
 			auto voice_state, util::in_voice_channel(bot, message, yield));
 		SABER_TRY(bot.player().connect(
 			*message.guild_id, *voice_state->channel_id, yield));
-		return bot.player().previous(*message.guild_id);
+		SABER_TRY(auto queue, bot.player().queue(*message.guild_id));
+		queue->previous();
+		return outcome::success();
 	}
 };
 

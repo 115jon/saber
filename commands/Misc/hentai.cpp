@@ -1,3 +1,5 @@
+#include <fmt/ranges.h>
+
 #include <boost/range/adaptors.hpp>
 #include <ekizu/embed_builder.hpp>
 #include <ekizu/json_util.hpp>
@@ -19,12 +21,13 @@ struct Hentai : Command {
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(2))
 					  .build()),
-		  m_reddit{RedditOptions{
-			  std::getenv("SABER_REDDIT_USERNAME"),
-			  std::getenv("SABER_REDDIT_PASSWORD"),
-			  std::getenv("SABER_REDDIT_APP_ID"),
-			  std::getenv("SABER_REDDIT_APP_SECRET"),
-		  }} {}
+		  m_reddit{creator.http().get_executor(),
+				   RedditOptions{
+					   std::getenv("SABER_REDDIT_USERNAME"),
+					   std::getenv("SABER_REDDIT_PASSWORD"),
+					   std::getenv("SABER_REDDIT_APP_ID"),
+					   std::getenv("SABER_REDDIT_APP_SECRET"),
+				   }} {}
 
 	Result<> execute(const ekizu::Message &message,
 					 const std::vector<std::string> &args,
@@ -39,13 +42,13 @@ struct Hentai : Command {
 			return outcome::success();
 		}
 
-		const auto query = fmt::to_string(fmt::join(args, ""));
+		const auto query = fmt::to_string(fmt::join(args, " "));
 		SABER_TRY(const auto sauce, search_hentai_subreddit(query, yield));
 		auto cm =
 			bot.http().create_message(message.channel_id).reply(message.id);
 
 		if (sauce.empty()) {
-			cm.content("No results found.");
+			SABER_TRY(cm.content("No results found.").send(yield));
 			return outcome::success();
 		}
 
@@ -76,10 +79,10 @@ struct Hentai : Command {
 
 		std::vector<nlohmann::json> filtered_posts;
 		using ekizu::json_util::not_null_all;
+		using ekizu::json_util::not_null_recursive;
 		std::copy_if(posts.begin(), posts.end(),
 					 std::back_inserter(filtered_posts), [](const auto &post) {
-						 return not_null_all(post, "data") &&
-								not_null_all(post["data"], "post_hint") &&
+						 return not_null_recursive(post, "data", "post_hint") &&
 								post["data"]["post_hint"] == "image";
 					 });
 

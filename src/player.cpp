@@ -1,207 +1,90 @@
 #include <ogg/ogg.h>
-#include <opusfile.h>
+#include <spdlog/spdlog.h>
+
+// clang-format off
+#include "fixed_utf8.hpp" // NOLINT
+// clang-format on
 
 #include <boost/asio/detached.hpp>
-#include <boost/beast/core/file.hpp>
 #include <boost/process/v2.hpp>
 #include <boost/scope_exit.hpp>
 #include <saber/player.hpp>
+#include <utility>
 
-namespace {
-constexpr uint32_t SAMPLE_RATE{48'000};
 namespace asio = boost::asio;
-}  // namespace
+namespace bp = boost::process::v2;
 
 namespace saber {
-Track GuildQueue::add_track(Track track) {
-	track.id = last_track_id++;
-	if (!current_track_id) { current_track_id = track.id; }
-	return track;
-}
+Player::Player(Connector connector) : m_connector(std::move(connector)) {}
 
-std::optional<uint64_t> GuildQueue::skip(uint64_t track_id) {
-	// Check if we're playing and we're not the last track.
-	if (!current_track_id || current_track_id == last_track_id) {
-		return std::nullopt;
+Result<GuildQueue *> Player::queue(ekizu::Snowflake guild_id) {
+	auto it = m_queues.find(guild_id);
+	if (it == m_queues.end()) {
+		return outcome::failure(boost::system::errc::operation_not_permitted);
 	}
-
-	auto ret = *current_track_id;
-
-	// Check if track_id is within our bounds. Going backwards is possible.
-	if (track_id >= last_track_id || track_id == ret) { return std::nullopt; }
-	current_track_id = track_id;
-	return ret;
-}
-
-PlayerConnection::PlayerConnection(ekizu::VoiceConnectionConfig config,
-								   GuildQueue& queue)
-	: m_queue{queue}, m_config{std::move(config)} {}
-
-Result<> PlayerConnection::pause() {
-	if (m_pause_timer) {
-		m_pause_timer->expires_at(boost::posix_time::pos_infin);
-	}
-	return outcome::success();
-}
-
-Result<> PlayerConnection::resume() {
-	if (m_pause_timer) {
-		m_pause_timer->expires_at(boost::posix_time::neg_infin);
-	}
-	return outcome::success();
-}
-
-Result<> PlayerConnection::send_track_data(TrackData data,
-										   const asio::yield_context& yield) {
-	if (!m_pause_timer) {
-		m_pause_timer.emplace(yield.get_executor());
-		m_pause_timer->expires_at(boost::posix_time::neg_infin);
-	}
-
-	// Only finish packet can be empty.
-	if (data.data.empty() && !data.finished) {
-		return boost::system::errc::invalid_argument;
-	}
-
-	if (!m_queue.current_track_id) { m_queue.current_track_id = data.track_id; }
-
-	boost::system::error_code ec;
-	++m_tasks;
-
-	if (m_tasks == 1) {
-		if (!m_task_timer) { m_task_timer.emplace(yield.get_executor()); }
-		m_task_timer->expires_at(boost::posix_time::pos_infin);
-	} else {
-		m_task_timer->async_wait(yield[ec]);
-		if (ec != asio::error::operation_aborted) { return ec; }
-	}
-
-	return do_send(std::move(data), yield);
-}
-
-Result<> PlayerConnection::do_send(TrackData data,
-								   const boost::asio::yield_context& yield) {
-	BOOST_SCOPE_EXIT_ALL(this) {
-		--m_tasks;
-		m_task_timer->cancel_one();
-	};
-
-	// Enqueue the data if it's not related to the current one.
-	if (m_queue.current_track_id != data.track_id) {
-		// Skip a finished non-pending track.
-		if (m_pending_tracks.find(data.track_id) == m_pending_tracks.end() &&
-			data.finished) {
-			return outcome::success();
-		}
-
-		m_pending_tracks[data.track_id].emplace(std::move(data));
-		return outcome::success();
-	}
-
-	// Proceed as normal.
-	if (!data.finished) { return send(data, yield); }
-
-	// Decrement the last_track_id.
-	--m_queue.last_track_id;
-
-	// If we have no more tracks, reset to original state.
-	if (m_pending_tracks.empty()) {
-		m_queue.current_track_id.reset();
-		SABER_TRY(m_voice_connection->silence(yield));
-		SABER_TRY(m_voice_connection->speak(ekizu::SpeakerFlag::None, yield));
-		m_speaking = false;
-		fmt::println(
-			"Reset to original state since there are no more songs to "
-			"play.");
-		return outcome::success();
-	}
-
-	// Play the next track.
-	auto& [track_id, queue] = *m_pending_tracks.begin();
-	m_queue.current_track_id = track_id;
-	fmt::println("Now playing track {}.", track_id);
-
-	BOOST_SCOPE_EXIT_ALL(this, tid = track_id) { m_pending_tracks.erase(tid); };
-
-	while (!queue.empty()) {
-		SABER_TRY(send(queue.front(), yield));
-
-		// TODO: Handle the finished flag if received.
-		if (queue.front().finished) {
-			fmt::println("Received finish flag when running queue.");
-			// return outcome::success();
-		}
-
-		queue.pop();
-	}
-
-	return outcome::success();
-}
-
-Result<> PlayerConnection::send(const TrackData& data,
-								const boost::asio::yield_context& yield) {
-	if (!m_voice_connection) {
-		SABER_TRY(auto conn, m_config.connect(yield));
-		m_voice_connection.emplace(std::move(conn));
-		SABER_TRY(m_voice_connection->run(yield));
-	}
-
-	if (!m_speaking) {
-		SABER_TRY(
-			m_voice_connection->speak(ekizu::SpeakerFlag::Microphone, yield));
-		fmt::println("Speaking");
-		m_speaking = true;
-	}
-
-	if (m_pause_timer) {
-		boost::system::error_code ec;
-		m_pause_timer->async_wait(yield[ec]);
-		if (ec && ec != asio::error::operation_aborted) { return ec; }
-	}
-
-	return m_voice_connection->send_opus(data.data, yield);
-}
-
-Player::Player(
-	std::function<Result<ekizu::VoiceConnectionConfig*>(
-		ekizu::Snowflake, ekizu::Snowflake, const asio::yield_context&)>
-		connector)
-	: m_connector(std::move(connector)) {}
-
-Result<std::optional<uint64_t>> Player::current_track_id(
-	ekizu::Snowflake guild_id) {
-	if (m_queues.find(guild_id) == m_queues.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	return m_queues[guild_id].current_track_id;
+	return outcome::success(it->second.get());
 }
 
 Result<bool> Player::connect(ekizu::Snowflake guild_id,
 							 ekizu::Snowflake channel_id,
-							 const asio::yield_context& yield) {
-	if (m_connections.has(guild_id)) { return false; }
+							 const asio::yield_context &yield) {
+	if (m_connections.contains(guild_id)) { return false; }
 
+	log<ekizu::LogLevel::Info>("Player connecting to guild {}", guild_id);
 	SABER_TRY(auto config, m_connector(guild_id, channel_id, yield));
 
-	m_connections.emplace(guild_id, *config, m_queues[guild_id]);
+	if (!m_queues.contains(guild_id)) {
+		m_queues.emplace(
+			guild_id, std::make_unique<GuildQueue>([this](ekizu::Log l) {
+				if (m_on_log) { m_on_log(std::move(l)); }
+			}));
+	}
+
+	m_connections.emplace(
+		guild_id, std::make_unique<PlayerConnection>(
+					  *config, m_queues[guild_id].get(), [this](ekizu::Log l) {
+						  if (m_on_log) { m_on_log(std::move(l)); }
+					  }));
 	return true;
 }
 
 Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 						   ekizu::Snowflake requester_id,
-						   const asio::yield_context& yield) {
-	if (!m_connections.has(guild_id)) {
+						   const asio::yield_context &yield) {
+	auto conn_it = m_connections.find(guild_id);
+	if (conn_it == m_connections.end()) {
+		return boost::system::errc::operation_not_permitted;
+	}
+
+	auto queue_it = m_queues.find(guild_id);
+	if (queue_it == m_queues.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
 	auto track =
-		m_queues[guild_id].add_track({{}, requester_id, std::string{query}});
+		queue_it->second->add_track({{}, requester_id, std::string{query}});
 
+	log<ekizu::LogLevel::Info>(
+		"Initiating play for track {} (Query: {})", track.id, query);
+
+	// SIMPLIFIED: No cancellation signals needed
+	// The connection's shutdown flag will handle cleanup
 	asio::spawn(
 		yield,
-		[this, guild_id, q = track.url, requester_id, tid = track.id](auto y) {
-			(void)play_sync(guild_id, q, requester_id, tid, y);
+		[this, guild_id, q = track.url, requester_id,
+		 tid = track.id](const auto &y) {
+			auto res = play_sync(guild_id, q, requester_id, tid, y);
+			if (res.has_error()) {
+				// Only log non-cancellation errors
+				if (res.error() != boost::system::errc::operation_canceled) {
+					log<ekizu::LogLevel::Error>(
+						"Playback failed for track {}: {}", tid,
+						res.error().message());
+				} else {
+					log<ekizu::LogLevel::Info>(
+						"Playback cancelled for track {}", tid);
+				}
+			}
 		},
 		asio::detached);
 
@@ -209,167 +92,302 @@ Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 }
 
 Result<> Player::pause(ekizu::Snowflake guild_id) {
-	if (!m_connections.has(guild_id)) {
+	auto it = m_connections.find(guild_id);
+	if (it == m_connections.end()) {
 		return boost::system::errc::no_such_file_or_directory;
 	}
-	return m_connections[guild_id]->pause();
+	return it->second->pause();
 }
 
 Result<> Player::resume(ekizu::Snowflake guild_id) {
-	if (!m_connections.has(guild_id)) {
+	auto it = m_connections.find(guild_id);
+	if (it == m_connections.end()) {
 		return boost::system::errc::no_such_file_or_directory;
 	}
-	return m_connections[guild_id]->resume();
+	return it->second->resume();
 }
 
-Result<> Player::skip(ekizu::Snowflake guild_id) {
-	if (!m_queues.contains(guild_id)) {
-		return boost::system::errc::no_such_file_or_directory;
+void Player::shutdown() {
+	log<ekizu::LogLevel::Info>("Player shutting down...");
+
+	for (auto &[guild_id, conn] : m_connections) {
+		if (conn) {
+			log<ekizu::LogLevel::Debug>(
+				"Shutting down connection for guild {}", guild_id);
+			conn->shutdown();
+		}
 	}
-	m_queues[guild_id].skip();
-	return outcome::success();
+
+	m_connections.clear();
+	m_queues.clear();
+
+	log<ekizu::LogLevel::Info>("Player shutdown complete");
 }
 
-Result<> Player::previous(ekizu::Snowflake guild_id) {
-	if (!m_queues.contains(guild_id)) {
-		return boost::system::errc::no_such_file_or_directory;
-	}
-	m_queues[guild_id].previous();
-	return outcome::success();
-}
-
-Result<std::string> Player::download_song(std::string_view query,
-										  const asio::yield_context& yield) {
-	namespace bp = boost::process::v2;
-
+Result<std::string> Player::resolve_url(std::string_view query,
+										const asio::yield_context &yield) {
 	boost::system::error_code ec;
+
 	auto exe = bp::environment::find_executable("yt-dlp");
-	if (exe.empty()) { return boost::system::errc::no_such_file_or_directory; }
+	if (exe.empty()) {
+		log<ekizu::LogLevel::Error>("yt-dlp executable not found");
+		return boost::system::errc::no_such_file_or_directory;
+	}
 
 	asio::readable_pipe rp{yield.get_executor()};
-	bp::process proc(
-		yield.get_executor(), exe,
-		{fmt::format("ytsearch1:\"{}\"", query), "-x", "--audio-format", "opus",
-		 "-f", "bestaudio", "-o", "%(id)s.f%(format_id)s.opus", "-O",
-		 "%(id)s.f%(format_id)s.opus", "--no-simulate"},
-		bp::process_stdio{{}, rp, {}});
+	asio::readable_pipe ep{yield.get_executor()};
 
-	auto code = proc.async_wait(yield[ec]);
-	if (code != 0) { return boost::system::errc::executable_format_error; }
-	if (ec) { return ec; }
-
-	size_t bytes{};
-	std::string song_name(128, '\0');
-
-	while (true) {
-		auto got = rp.async_read_some(
-			asio::buffer(song_name.data() + bytes, song_name.size() - bytes),
-			yield[ec]);
-		bytes += got;
-		if (ec && ec != asio::error::broken_pipe) { return ec; }
-		if (got < song_name.size()) { break; }
-		song_name.resize(song_name.size() * 2);
+	std::string search_arg;
+	if (query.find("http") == 0) {
+		search_arg = std::string{query};
+	} else {
+		search_arg = fmt::format("ytsearch1:{}", query);
 	}
 
-	song_name.resize(bytes - 1);
-	return song_name;
+	std::vector<std::string> args{
+		"--no-playlist", "--quiet", "--no-warnings", "--get-url", "-f",
+		"bestaudio",	 search_arg};
+
+	bp::process proc(
+		yield.get_executor(), exe, args, bp::process_stdio{{}, rp, ep});
+
+	// Spawn a coroutine to drain stderr (prevent deadlock)
+	asio::spawn(
+		yield.get_executor(),
+		[ep = std::move(ep)](const auto &y) mutable {
+			auto buf = std::make_shared<std::array<char, 4096>>();
+			boost::system::error_code ignore;
+			while (true) {
+				size_t n = ep.async_read_some(asio::buffer(*buf), y[ignore]);
+				if (ignore || n == 0) { break; }
+			}
+		},
+		asio::detached);
+
+	std::string url;
+	std::array<char, 4096> chunk{};
+	while (true) {
+		auto n = rp.async_read_some(asio::buffer(chunk), yield[ec]);
+		if (n > 0) { url.append(chunk.data(), n); }
+		if (ec) { break; }
+	}
+
+	int exit_code = proc.async_wait(yield[ec]);
+
+	// Trim whitespace
+	while (!url.empty() && (std::isspace(url.back()) != 0)) { url.pop_back(); }
+	while (!url.empty() && (std::isspace(url.front()) != 0)) {
+		url.erase(0, 1);
+	}
+
+	if (exit_code != 0 || url.empty()) {
+		return boost::system::errc::no_message_available;
+	}
+
+	return url;
 }
 
 Result<> Player::play_sync(ekizu::Snowflake guild_id, std::string_view query,
 						   ekizu::Snowflake requester_id, uint64_t track_id,
-						   const boost::asio::yield_context& yield) {
-	SABER_TRY(auto song_name, download_song(query, yield));
-	boost::system::error_code ec;
-	boost::beast::file file;
+						   const asio::yield_context &yield) {
+	SABER_TRY(auto url, resolve_url(query, yield));
+	log<ekizu::LogLevel::Info>("Resolved URL for track {}: {}", track_id, url);
 
-	file.open(song_name.data(), boost::beast::file_mode::read, ec);
-	if (ec) { return ec; }
+	auto conn_it = m_connections.find(guild_id);
+	if (conn_it == m_connections.end()) {
+		return boost::system::errc::no_such_file_or_directory;
+	}
 
-	auto sz = static_cast<long>(file.size(ec));
-	if (ec) { return ec; }
+	PlayerConnection *conn = conn_it->second.get();
 
-	ogg_sync_state oy;
-	ogg_stream_state os;
-	ogg_page og;
-	ogg_packet op;
-	OpusHead header;
+	// Check if connection was shut down
+	if (conn->is_shutdown()) { return boost::system::errc::operation_canceled; }
 
-	BOOST_SCOPE_EXIT_ALL(&) {
-		ogg_stream_clear(&os);
-		ogg_sync_clear(&oy);
+	auto res = stream_ffmpeg(conn, url, requester_id, track_id, yield);
+
+	// Send final packet to signal track end (only if not shutting down)
+	if (!conn->is_shutdown()) {
+		boost::system::error_code ignore;
+		(void)conn->send_track_data(
+			{{}, true, requester_id, track_id}, yield[ignore]);
+	}
+
+	return res;
+}
+
+Result<> Player::stream_ffmpeg(PlayerConnection *conn, std::string_view url,
+							   ekizu::Snowflake requester_id, uint64_t track_id,
+							   const asio::yield_context &yield) {
+	auto ffmpeg_exe = bp::environment::find_executable("ffmpeg");
+	if (ffmpeg_exe.empty()) {
+		return boost::system::errc::no_such_file_or_directory;
+	}
+
+	asio::readable_pipe rp{yield.get_executor()};
+	asio::readable_pipe ep{yield.get_executor()};
+
+	std::vector<std::string> args{
+		"-reconnect",
+		"1",
+		"-reconnect_streamed",
+		"1",
+		"-reconnect_at_eof",
+		"1",
+		"-reconnect_delay_max",
+		"5",
+		"-user_agent",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
+		"like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"-loglevel",
+		"warning",
+		"-i",
+		std::string{url},
+		"-map",
+		"0:a",
+		"-c:a",
+		"libopus",
+		"-b:a",
+		"128k",
+		"-f",
+		"ogg",
+		"-"};
+
+	bp::process proc(
+		yield.get_executor(), ffmpeg_exe, args, bp::process_stdio{{}, rp, ep});
+
+	// Spawn a coroutine to drain stderr
+	asio::spawn(
+		yield.get_executor(),
+		[ep = std::move(ep)](const auto &y) mutable {
+			auto buf = std::make_shared<std::array<char, 4096>>();
+			boost::system::error_code ignore;
+			while (true) {
+				size_t n = ep.async_read_some(asio::buffer(*buf), y[ignore]);
+				if (ignore || n == 0) { break; }
+			}
+		},
+		asio::detached);
+
+	BOOST_SCOPE_EXIT_ALL(&proc) {
+		boost::system::error_code ignore;
+		proc.request_exit(ignore);
 	};
+
+	log<ekizu::LogLevel::Info>("Starting ffmpeg stream for track {}", track_id);
+	return process_ogg_stream(conn, rp, requester_id, track_id, yield);
+}
+
+Result<> Player::process_ogg_stream(
+	PlayerConnection *conn, asio::readable_pipe &rp,
+	ekizu::Snowflake requester_id, uint64_t track_id,
+	const asio::yield_context &yield) {
+	ogg_sync_state oy{};
+	ogg_stream_state os{};
+	ogg_page og{};
+	ogg_packet op{};
+	bool stream_init = false;
 
 	ogg_sync_init(&oy);
 
-	auto* data = ogg_sync_buffer(&oy, sz);
+	// Persistent buffer – outlives any pending async operation
+	auto read_buffer = std::make_shared<std::vector<uint8_t>>(8192);
+	boost::system::error_code ec;
 
-	file.read(data, sz, ec);
-	if (ec) { return ec; }
+	// RAII cleanup that runs exactly once when coroutine exits (any path)
+	struct Cleanup {
+		asio::readable_pipe &rp;
+		ogg_stream_state *os;
+		bool *stream_init;
+		ogg_sync_state *oy;
 
-	ogg_sync_wrote(&oy, sz);
+		~Cleanup() {
+			rp.cancel();
 
-	if (ogg_sync_pageout(&oy, &og) != 1) {
-		return boost::system::errc::io_error;
-	}
-
-	ogg_stream_init(&os, ogg_page_serialno(&og));
-
-	if (ogg_stream_pagein(&os, &og) < 0 ||
-		ogg_stream_packetout(&os, &op) != 1) {
-		return boost::system::errc::io_error;
-	}
-
-	if (op.bytes < 8 || std::memcmp(op.packet, "OpusHead", 8) != 0) {
-		return boost::system::errc::io_error;
-	}
-
-	if (opus_head_parse(&header, op.packet, static_cast<size_t>(op.bytes)) !=
-		OPUS_OK) {
-		return boost::system::errc::io_error;
-	}
-
-	if (header.channel_count != 2 || header.input_sample_rate != SAMPLE_RATE) {
-		return boost::system::errc::io_error;
-	}
-
-	auto& conn = *m_connections[guild_id];
-
-	BOOST_SCOPE_EXIT_ALL(&) {
-		(void)conn.send_track_data({{}, true, requester_id, track_id}, yield);
+			// Clean up ogg state
+			if ((stream_init != nullptr) && *stream_init) {
+				ogg_stream_clear(os);
+			}
+			ogg_sync_clear(oy);
+		}
 	};
 
-	while (ogg_sync_pageout(&oy, &og) == 1) {
-		ogg_stream_init(&os, ogg_page_serialno(&og));
+	Cleanup cleanup_guard{rp, &os, &stream_init, &oy};
+	(void)cleanup_guard;
 
-		if (ogg_stream_pagein(&os, &og) < 0) {
-			return boost::system::errc::io_error;
+	while (true) {
+		// Check if connection was shut down
+		if (conn->is_shutdown()) {
+			log<ekizu::LogLevel::Info>(
+				"Connection shutdown detected, stopping track {}", track_id);
+			return boost::system::errc::operation_canceled;
 		}
 
-		while (ogg_stream_packetout(&os, &op) != 0) {
-			if (op.bytes > 8 && std::memcmp("OpusHead", op.packet, 8) == 0) {
-				if (opus_head_parse(&header, op.packet,
-									static_cast<size_t>(op.bytes)) != OPUS_OK) {
-					return boost::system::errc::io_error;
-				}
+		// Prepare buffer
+		read_buffer->resize(8192);
+		size_t bytes_read =
+			rp.async_read_some(asio::buffer(*read_buffer), yield[ec]);
 
-				if (header.channel_count != 2 ||
-					header.input_sample_rate != SAMPLE_RATE) {
-					return boost::system::errc::io_error;
-				}
+		// Handle cancellation gracefully
+		if (ec == asio::error::operation_aborted) {
+			log<ekizu::LogLevel::Info>(
+				"Stream read cancelled for track {}", track_id);
+			return boost::system::errc::operation_canceled;
+		}
 
-				continue;
+		if (ec) {
+			if (ec != asio::error::eof && ec != asio::error::broken_pipe) {
+				log<ekizu::LogLevel::Error>(
+					"Stream read error for track {}: {}", track_id,
+					ec.message());
+			}
+			break;
+		}
+
+		read_buffer->resize(bytes_read);
+		if (bytes_read == 0) { break; }
+
+		char *ogg_buf = ogg_sync_buffer(&oy, static_cast<long>(bytes_read));
+		std::memcpy(ogg_buf, read_buffer->data(), bytes_read);
+		ogg_sync_wrote(&oy, static_cast<long>(bytes_read));
+
+		while (ogg_sync_pageout(&oy, &og) == 1) {
+			if (!stream_init) {
+				ogg_stream_init(&os, ogg_page_serialno(&og));
+				stream_init = true;
+			} else if (ogg_page_serialno(&og) != os.serialno) {
+				ogg_stream_reset_serialno(&os, ogg_page_serialno(&og));
 			}
 
-			if (op.bytes > 8 && std::memcmp("OpusTags", op.packet, 8) == 0) {
-				continue;
+			if (ogg_stream_pagein(&os, &og) < 0) { continue; }
+
+			while (ogg_stream_packetout(&os, &op) != 0) {
+				// Skip Opus header packets
+				if (op.bytes > 8 &&
+					(std::memcmp(op.packet, "OpusHead", 8) == 0 ||
+					 std::memcmp(op.packet, "OpusTags", 8) == 0)) {
+					continue;
+				}
+
+				auto span = boost::as_bytes(
+					boost::span{op.packet, static_cast<size_t>(op.bytes)});
+
+				auto res = conn->send_track_data(
+					{{span.begin(), span.end()}, {}, requester_id, track_id},
+					yield);
+
+				if (res.has_error()) {
+					if (res.error() ==
+						boost::system::errc::operation_canceled) {
+						log<ekizu::LogLevel::Info>(
+							"Track {} canceled during playback", track_id);
+					} else {
+						log<ekizu::LogLevel::Error>(
+							"Failed to send track data for {}: {}", track_id,
+							res.error().message());
+					}
+					return res;
+				}
 			}
-
-			auto span = boost::as_bytes(
-				boost::span{op.packet, static_cast<size_t>(op.bytes)});
-
-			SABER_TRY(conn.send_track_data(
-				{{span.begin(), span.end()}, {}, requester_id, track_id},
-				yield));
 		}
 	}
 

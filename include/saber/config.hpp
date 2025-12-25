@@ -3,8 +3,8 @@
 
 #include <saber/export.h>
 
+#include <ekizu/result.hpp>
 #include <ekizu/snowflake.hpp>
-#include <ekizu/util.hpp>
 #include <nlohmann/json_fwd.hpp>
 
 namespace saber {
