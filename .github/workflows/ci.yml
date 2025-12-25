@@ -57,22 +57,23 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++-12 libssl-dev ninja-build rpm zlib1g-dev
+          sudo apt-get install -y cmake g++-12 libssl-dev ninja-build rpm zlib1g-dev libtool autoconf
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        uses: johnwason/vcpkg-action@v5
+      - name: Install dependencies (vcpkg)
+        uses: johnwason/vcpkg-action@v7
         id: vcpkg
         with:
-          pkgs: openssl zlib
-          triplet: ${{ matrix.config.arch }}-windows-static
-          cache-key: windows-${{ matrix.config.arch }}-vcpkg
+          manifest-dir: ${{ github.workspace }}
+          triplet: ${{ runner.os == 'Windows' && format('{0}-windows-release', matrix.config.arch) || 'x64-linux-release' }}
+          cache-key: ${{ runner.os }}-${{ matrix.config.arch }}-release-vcpkg
           token: ${{ github.token }}
 
       - name: Add MSBuild to PATH (Windows)
@@ -81,7 +82,7 @@ jobs:
 
       - name: Configure CMake (Linux)
         if: runner.os == 'Linux'
-        run: cmake -S . -B build -G Ninja
+        run: cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
         env:
           CXX: g++-12
 
@@ -105,7 +106,7 @@ jobs:
         run: Move-Item build/bin/${{ matrix.config.binary_path }} build/bin/${{ matrix.config.output_name }}
 
       - name: Upload Binary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.config.output_name }}
           path: ./build/bin/${{ matrix.config.output_name }}
@@ -118,7 +119,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Get Next Version
         id: semver
@@ -169,7 +172,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: .
 
