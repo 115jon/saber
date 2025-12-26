@@ -3,7 +3,10 @@
 
 #include <boost/asio/readable_pipe.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <chrono>
 #include <ekizu/voice_connection.hpp>
+#include <memory>
+#include <optional>
 #include <saber/guild_queue.hpp>
 #include <saber/player_connection.hpp>
 #include <saber/result.hpp>
@@ -29,8 +32,10 @@ struct Player {
 		ekizu::Snowflake guild_id, std::string_view query,
 		ekizu::Snowflake requester_id, const boost::asio::yield_context &yield);
 
-	[[nodiscard]] SABER_EXPORT Result<> pause(ekizu::Snowflake guild_id);
+	[[nodiscard]] SABER_EXPORT Result<bool> skip(ekizu::Snowflake guild_id);
+	[[nodiscard]] SABER_EXPORT Result<bool> previous(ekizu::Snowflake guild_id);
 
+	[[nodiscard]] SABER_EXPORT Result<> pause(ekizu::Snowflake guild_id);
 	[[nodiscard]] SABER_EXPORT Result<> resume(ekizu::Snowflake guild_id);
 
 	void shutdown();
@@ -39,6 +44,22 @@ struct Player {
 	}
 
    private:
+	struct StreamResources;
+
+	struct PlaybackState {
+		bool running{};
+		bool paused{};
+		std::chrono::steady_clock::time_point track_started;
+		std::chrono::steady_clock::duration paused_total{};
+		std::optional<std::chrono::steady_clock::time_point> pause_started;
+		std::shared_ptr<StreamResources> active_stream;
+	};
+
+	struct TrackMetadata {
+		std::string webpage_url;
+		std::string title;
+	};
+
 	template <ekizu::LogLevel level, typename... Args>
 	void log(fmt::format_string<Args...> fmtstr, Args &&...args) const {
 		if (!m_on_log) { return; }
@@ -50,16 +71,18 @@ struct Player {
 						fmt::format(fmtstr, std::forward<Args>(args)...))});
 	}
 
-	[[nodiscard]] Result<std::string> resolve_url(
+	[[nodiscard]] Result<TrackMetadata> resolve_metadata(
 		std::string_view query, const boost::asio::yield_context &yield);
 
-	[[nodiscard]] Result<> play_sync(
+	[[nodiscard]] Result<std::string> resolve_url(
 		ekizu::Snowflake guild_id, std::string_view query,
-		ekizu::Snowflake requester_id, uint64_t track_id,
 		const boost::asio::yield_context &yield);
 
+	[[nodiscard]] Result<> play_sync(ekizu::Snowflake guild_id, Track &track,
+									 const boost::asio::yield_context &yield);
+
 	[[nodiscard]] Result<> stream_ffmpeg(
-		PlayerConnection *conn, std::string_view url,
+		ekizu::Snowflake guild_id, PlayerConnection *conn, std::string_view url,
 		ekizu::Snowflake requester_id, uint64_t track_id,
 		const boost::asio::yield_context &yield);
 
@@ -68,12 +91,20 @@ struct Player {
 		ekizu::Snowflake requester_id, uint64_t track_id,
 		const boost::asio::yield_context &yield);
 
+	[[nodiscard]] Result<> playback_loop(
+		ekizu::Snowflake guild_id, const boost::asio::yield_context &yield);
+
+	void cancel_active_stream(ekizu::Snowflake guild_id);
+	std::chrono::steady_clock::duration playback_elapsed(
+		const PlaybackState &st) const;
+
 	Connector m_connector;
 	boost::unordered_flat_map<ekizu::Snowflake, std::unique_ptr<GuildQueue>>
 		m_queues;
 	boost::unordered_flat_map<ekizu::Snowflake,
 							  std::unique_ptr<PlayerConnection>>
 		m_connections;
+	boost::unordered_flat_map<ekizu::Snowflake, PlaybackState> m_playback;
 	std::function<void(ekizu::Log)> m_on_log;
 };
 

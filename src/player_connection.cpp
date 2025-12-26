@@ -35,6 +35,15 @@ Result<> PlayerConnection::resume() {
 	return outcome::success();
 }
 
+void PlayerConnection::interrupt_playback() {
+	if (m_shutdown.load(std::memory_order_acquire)) { return; }
+
+	m_interrupted.store(true, std::memory_order_release);
+
+	// Only intended to wake send() if it's currently blocked on the pause wait.
+	if (m_pause_timer) { m_pause_timer->cancel(); }
+}
+
 void PlayerConnection::shutdown() {
 	log<ekizu::LogLevel::Info>("PlayerConnection shutting down");
 
@@ -58,6 +67,24 @@ void PlayerConnection::shutdown() {
 	log<ekizu::LogLevel::Debug>("PlayerConnection shutdown complete");
 }
 
+Result<> PlayerConnection::stop_speaking(const asio::yield_context &yield) {
+	if (m_shutdown.load(std::memory_order_acquire)) {
+		return boost::system::errc::operation_canceled;
+	}
+
+	// Nothing to do if we never connected voice.
+	if (!m_voice_connection) {
+		m_speaking = false;
+		return outcome::success();
+	}
+
+	SABER_TRY(m_voice_connection->silence(yield));
+	SABER_TRY(m_voice_connection->speak(ekizu::SpeakerFlag::None, yield));
+	m_speaking = false;
+	log<ekizu::LogLevel::Info>("Stopped speaking");
+	return outcome::success();
+}
+
 Result<> PlayerConnection::send_track_data(TrackData data,
 										   const asio::yield_context &yield) {
 	if (m_shutdown.load(std::memory_order_acquire)) {
@@ -72,8 +99,12 @@ Result<> PlayerConnection::send_track_data(TrackData data,
 	}
 
 	if (data.data.empty() && !data.finished) { return outcome::success(); }
-	if (!m_queue->current_track_id) {
-		m_queue->current_track_id = data.track_id;
+
+	// Enforce "single active track": drop any packets that don't match the
+	// queue-selected current track.
+	if (m_queue->current_track_id &&
+		(*m_queue->current_track_id != data.track_id)) {
+		return outcome::success();
 	}
 
 	boost::system::error_code ec;
@@ -108,63 +139,21 @@ Result<> PlayerConnection::do_send(TrackData data,
 		return boost::system::errc::operation_canceled;
 	}
 
-	if (m_queue->current_track_id != data.track_id) {
-		if (m_pending_tracks.find(data.track_id) == m_pending_tracks.end() &&
-			data.finished) {
-			log<ekizu::LogLevel::Debug>(
-				"Skipping finished packet for non-current track {}",
-				data.track_id);
-			return outcome::success();
-		}
-		m_pending_tracks[data.track_id].emplace(std::move(data));
+	// If a different track became current since we were queued, drop the
+	// packet.
+	if (m_queue->current_track_id &&
+		(*m_queue->current_track_id != data.track_id)) {
 		return outcome::success();
 	}
 
-	if (!data.finished) { return send(data, yield); }
-
-	log<ekizu::LogLevel::Info>("Track {} finished", data.track_id);
-	--m_queue->last_track_id;
-
-	while (!m_pending_tracks.empty()) {
-		// Check shutdown between tracks
-		if (m_shutdown.load(std::memory_order_acquire)) {
-			return boost::system::errc::operation_canceled;
-		}
-
-		auto &[track_id, queue] = *m_pending_tracks.begin();
-
-		BOOST_SCOPE_EXIT_ALL(this, tid = track_id) {
-			m_pending_tracks.erase(tid);
-			if (m_queue) { --m_queue->last_track_id; }
-		};
-
-		m_queue->current_track_id = track_id;
-		log<ekizu::LogLevel::Info>("Now playing pending track {}", track_id);
-
-		while (!queue.empty()) {
-			// Check shutdown during queue processing
-			if (m_shutdown.load(std::memory_order_acquire)) {
-				return boost::system::errc::operation_canceled;
-			}
-
-			SABER_TRY(send(queue.front(), yield));
-			if (queue.front().finished) { break; }
-			queue.pop();
-		}
+	// Finished packets are used only as a signal by the Player; no sequencing
+	// here.
+	if (data.finished) {
+		log<ekizu::LogLevel::Debug>("Track {} finished", data.track_id);
+		return outcome::success();
 	}
 
-	m_queue->current_track_id.reset();
-
-	// Check if voice connection is still valid before using it
-	if (m_voice_connection && !m_shutdown.load(std::memory_order_acquire)) {
-		SABER_TRY(m_voice_connection->silence(yield));
-		SABER_TRY(m_voice_connection->speak(ekizu::SpeakerFlag::None, yield));
-	}
-
-	m_speaking = false;
-	log<ekizu::LogLevel::Info>("Queue empty, resetting state");
-
-	return outcome::success();
+	return send(data, yield);
 }
 
 Result<> PlayerConnection::send(const TrackData &data,
@@ -217,13 +206,23 @@ Result<> PlayerConnection::send(const TrackData &data,
 		boost::system::error_code ec;
 		m_pause_timer->async_wait(yield[ec]);
 
-		// If cancelled due to shutdown, return immediately
-		if (ec == asio::error::operation_aborted &&
-			m_shutdown.load(std::memory_order_acquire)) {
+		if (ec == asio::error::operation_aborted) {
+			// If cancelled due to shutdown, return immediately
+			if (m_shutdown.load(std::memory_order_acquire)) {
+				return boost::system::errc::operation_canceled;
+			}
+
+			// If interrupted (skip/previous while paused), do not send any
+			// audio; unwind to let the Player switch tracks.
+			if (m_interrupted.exchange(false, std::memory_order_acq_rel)) {
+				return boost::system::errc::operation_canceled;
+			}
+
+			// Defensive: treat unexpected cancellations as a cancel signal.
 			return boost::system::errc::operation_canceled;
 		}
 
-		if (ec && ec != asio::error::operation_aborted) { return ec; }
+		if (ec) { return ec; }
 
 		// Check if we were shut down while waiting
 		if (m_shutdown.load(std::memory_order_acquire)) {

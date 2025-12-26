@@ -1,5 +1,15 @@
+#include <fmt/format.h>
+
+#include <algorithm>
 #include <boost/algorithm/string/join.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <ekizu/embed.hpp>
 #include <saber/util.hpp>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 using ekizu::Permissions;
@@ -56,8 +66,8 @@ const boost::unordered_flat_map<Permissions, std::string_view>
 
 namespace saber::util {
 Result<> ensure_permissions(
-	Saber& bot, const ekizu::Message& message, ekizu::Snowflake user_id,
-	ekizu::Permissions required, const boost::asio::yield_context& yield) {
+	Saber &bot, const ekizu::Message &message, ekizu::Snowflake user_id,
+	ekizu::Permissions required, const boost::asio::yield_context &yield) {
 	auto user_perms = bot.get_guild_permissions(*message.guild_id, user_id);
 
 	if (!user_perms) {
@@ -75,7 +85,7 @@ Result<> ensure_permissions(
 
 	if (missing == 0) { return outcome::success(); }
 
-	for (const auto& [perm, name] : permission_strings) {
+	for (const auto &[perm, name] : permission_strings) {
 		if ((missing & static_cast<size_t>(perm)) != 0) {
 			missing_permissions.emplace_back(name);
 		}
@@ -93,19 +103,19 @@ Result<> ensure_permissions(
 	return boost::system::error_code{};
 }
 
-Result<boost::optional<ekizu::VoiceState&>> in_voice_channel(
-	Saber& bot, const ekizu::Message& msg,
-	const boost::asio::yield_context& yield) {
+Result<boost::optional<ekizu::VoiceState &>> in_voice_channel(
+	Saber &bot, const ekizu::Message &msg,
+	const boost::asio::yield_context &yield) {
 	if (!msg.guild_id) {
 		return outcome::failure(boost::system::errc::invalid_argument);
 	}
 
 	auto voice_state =
-		bot.voice_states().get(*msg.guild_id).flat_map([&](auto& users) {
+		bot.voice_states().get(*msg.guild_id).flat_map([&](auto &users) {
 			return users.get(msg.author.id);
 		});
 
-	if (!voice_state.map([](auto& state) { return !!state.channel_id; })
+	if (!voice_state.map([](auto &state) { return !!state.channel_id; })
 			 .value_or(false)) {
 		SABER_TRY(bot.http()
 					  .create_message(msg.channel_id)
@@ -117,4 +127,62 @@ Result<boost::optional<ekizu::VoiceState&>> in_voice_channel(
 
 	return outcome::success(voice_state);
 }
+
+std::string truncate(std::string_view s, size_t max_len) {
+	if (s.size() <= max_len) { return std::string{s}; }
+	if (max_len <= 3) { return std::string{s.substr(0, max_len)}; }
+	return fmt::format("{}...", s.substr(0, max_len - 3));
+}
+
+std::optional<size_t> find_index_by_id(const std::deque<Track> &tracks,
+									   std::optional<uint64_t> id) {
+	if (!id) { return std::nullopt; }
+	for (size_t i = 0; i < tracks.size(); ++i) {
+		if (tracks[i].id == *id) { return i; }
+	}
+	return std::nullopt;
+}
+
+std::string format_track_line(const Track &track, bool is_current) {
+	// Keep it short-ish to avoid embed limits.
+	const auto title = truncate(track.title, 96);
+
+	if (is_current) { return fmt::format("**`{}`** `{}`", track.id, title); }
+	return fmt::format("`{}` `{}`", track.id, title);
+}
+
+std::string now_playing_line(const std::deque<Track> &tracks,
+							 std::optional<uint64_t> current_id) {
+	auto idx = find_index_by_id(tracks, current_id);
+	if (!idx) { return "—"; }
+	return format_track_line(tracks[*idx], /*is_current=*/true);
+}
+
+std::string up_next_line(const std::deque<Track> &tracks,
+						 std::optional<uint64_t> current_id) {
+	auto idx = find_index_by_id(tracks, current_id);
+	if (!idx) { return "—"; }
+	const auto next = *idx + 1;
+	if (next >= tracks.size()) { return "—"; }
+	return format_track_line(tracks[next], /*is_current=*/false);
+}
+
+ekizu::Embed music_action_embed(
+	std::string title, uint16_t color, std::string description,
+	std::string now_line, std::string next_line, std::string footer_text) {
+	return ekizu::EmbedBuilder()
+		.set_title(std::move(title))
+		.set_color(color)
+		.set_description(std::move(description))
+		.add_field(ekizu::EmbedField{"Now playing", std::move(now_line), false})
+		.add_field(ekizu::EmbedField{"Up next", std::move(next_line), false})
+		.set_footer(ekizu::EmbedFooter{std::move(footer_text)})
+		.build();
+}
+
+size_t page_count(size_t item_count, size_t page_size) {
+	if (page_size == 0) { return 1; }
+	return std::max<size_t>(1, (item_count + page_size - 1) / page_size);
+}
+
 }  // namespace saber::util

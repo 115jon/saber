@@ -1,6 +1,5 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/range/adaptor/transformed.hpp>
-#include <ekizu/embed_builder.hpp>
 #include <saber/saber.hpp>
 
 using namespace saber;

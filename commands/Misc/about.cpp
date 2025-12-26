@@ -1,4 +1,3 @@
-#include <ekizu/embed_builder.hpp>
 #include <saber/saber.hpp>
 
 using namespace saber;

@@ -1,5 +1,4 @@
 #include <boost/algorithm/string/join.hpp>
-#include <ekizu/embed_builder.hpp>
 #include <saber/util.hpp>
 
 using namespace saber;
@@ -43,11 +42,20 @@ struct Play : Command {
 												message.author.id, yield));
 		SABER_TRY(auto queue, bot.player().queue(*message.guild_id));
 
+		const std::string display =
+			!track.title.empty()
+				? fmt::format("[{}]({})", track.title,
+							  track.webpage_url.empty()
+								  ? std::string{"about:blank"}
+								  : track.webpage_url)
+				: (!track.webpage_url.empty() ? track.webpage_url
+											  : std::string{"(unknown)"});
+
 		auto description =
 			queue->current_track_id != track.id
 				? fmt::format(
-					  "**✅ Added to queue\n** `{}` - `{}`", query, track.id)
-				: fmt::format("**▶️ Started playing\n** `{}`", query);
+					  "**✅ Added to queue**\n{}\n`{}`", display, track.id)
+				: fmt::format("**▶️ Started playing**\n{}", display);
 
 		auto embed = ekizu::EmbedBuilder().set_description(description).build();
 
@@ -81,8 +89,10 @@ struct Play : Command {
 
 		// --- Collector Implementation ---
 
-		// Filter: Only allow the command author to use the buttons
-		auto filter = [author_id = message.author.id](
+		// Filter: Only allow the command author to use the buttons AND only for
+		// this specific message (prevents multiple collectors in the same
+		// channel from racing / double-responding).
+		auto filter = [author_id = message.author.id, msg_id = msg.id](
 						  const ekizu::Interaction &interaction,
 						  const ekizu::MessageComponentData &data) {
 			std::optional<ekizu::Snowflake> user_id;
@@ -92,10 +102,17 @@ struct Play : Command {
 				user_id = interaction.user->id;
 			}
 
-			return user_id == author_id &&
-				   (data.custom_id == "track_previous" ||
-					data.custom_id == "track_toggle_pause" ||
-					data.custom_id == "track_skip");
+			if (user_id != author_id) { return false; }
+
+			if (data.custom_id != "track_previous" &&
+				data.custom_id != "track_toggle_pause" &&
+				data.custom_id != "track_skip") {
+				return false;
+			}
+
+			// Buttons always include the source message; ensure it's ours.
+			if (!interaction.message) { return false; }
+			return interaction.message->id == msg_id;
 		};
 
 		// Create collector (Active for 10 minutes)
@@ -105,23 +122,59 @@ struct Play : Command {
 
 		bool is_paused = false;
 
+		auto ack_interaction = [&](const ekizu::Interaction &i) {
+			// Never let ack failures abort the /play command coroutine (that’s
+			// what causes "Failed to process command: ...").
+			boost::system::error_code ec;
+			(void)bot.http()
+				.interaction(i.application_id)
+				.create_response(i.id, i.token,
+								 ekizu::InteractionResponseBuilder()
+									 .type(ekizu::InteractionResponseType::
+											   DeferredUpdateMessage)
+									 .build())
+				.send(yield[ec]);
+		};
+
+		auto send_followup = [&](std::string content) {
+			// Same: do not fail /play if the follow-up message fails.
+			boost::system::error_code ec;
+			(void)bot.http()
+				.create_message(message.channel_id)
+				.content(std::move(content))
+				.send(yield[ec]);
+		};
+
 		while (true) {
 			auto res = collector->async_receive(yield);
 			if (!res) { break; }  // Timeout or error
 
 			auto &[i, data] = res.value();
 
-			// Handle Actions
+			// Ack first so Discord doesn't show "Interaction Failed" even if
+			// the player operation is slow.
+			ack_interaction(i);
+
 			if (data.custom_id == "track_skip") {
-				if (auto q = bot.player().queue(*message.guild_id)) {
-					q.value()->skip();
+				auto r = bot.player().skip(*message.guild_id);
+				if (!r) {
+					send_followup(
+						fmt::format("Skip failed: {}", r.error().message()));
+				} else if (!r.value()) {
+					send_followup("There is no next track.");
 				}
 			} else if (data.custom_id == "track_previous") {
-				if (auto q = bot.player().queue(*message.guild_id)) {
-					q.value()->previous();
+				auto r = bot.player().previous(*message.guild_id);
+				if (!r) {
+					send_followup(fmt::format(
+						"Previous failed: {}", r.error().message()));
+				} else if (!r.value()) {
+					send_followup("There is no previous track.");
 				}
 			} else if (data.custom_id == "track_toggle_pause") {
 				if (is_paused) {
+					// Keep SABER_TRY here: pause/resume failure should be
+					// visible.
 					SABER_TRY(bot.player().resume(*message.guild_id));
 					is_paused = false;
 				} else {
@@ -129,18 +182,6 @@ struct Play : Command {
 					is_paused = true;
 				}
 			}
-
-			// Acknowledge interaction to prevent "Interaction Failed" error
-			// We use DeferredUpdateMessage so the UI doesn't flicker
-			SABER_TRY(
-				bot.http()
-					.interaction(i.application_id)
-					.create_response(i.id, i.token,
-									 ekizu::InteractionResponseBuilder()
-										 .type(ekizu::InteractionResponseType::
-												   DeferredUpdateMessage)
-										 .build())
-					.send(yield));
 		}
 
 		// Cleanup: Disable buttons when collector times out

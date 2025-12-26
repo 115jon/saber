@@ -1,7 +1,6 @@
 #include <fmt/ranges.h>
 
 #include <boost/range/adaptors.hpp>
-#include <ekizu/embed_builder.hpp>
 #include <ekizu/json_util.hpp>
 #include <saber/reddit.hpp>
 #include <saber/saber.hpp>

@@ -25,7 +25,59 @@ struct Skip : Command {
 		SABER_TRY(bot.player().connect(
 			*message.guild_id, *voice_state->channel_id, yield));
 		SABER_TRY(auto queue, bot.player().queue(*message.guild_id));
-		queue->skip();
+
+		const auto footer =
+			fmt::format("Requested by {}", message.author.username);
+
+		if (!queue || queue->tracks.empty() || !queue->current_track_id) {
+			auto embed = util::music_action_embed(
+				"Nothing to skip", util::k_color_warn,
+				"No track is currently playing in this server.",
+				util::now_playing_line(
+					queue ? queue->tracks : std::deque<Track>{},
+					queue ? queue->current_track_id
+						  : std::optional<uint64_t>{}),
+				util::up_next_line(queue ? queue->tracks : std::deque<Track>{},
+								   queue ? queue->current_track_id
+										 : std::optional<uint64_t>{}),
+				footer);
+
+			SABER_TRY(bot.http()
+						  .create_message(message.channel_id)
+						  .embeds({std::move(embed)})
+						  .reply(message.id)
+						  .send(yield));
+			return outcome::success();
+		}
+
+		SABER_TRY(auto ok, bot.player().skip(*message.guild_id));
+		if (!ok) {
+			auto embed = util::music_action_embed(
+				"No next track", util::k_color_warn,
+				"You’re already at the end of the queue.",
+				util::now_playing_line(queue->tracks, queue->current_track_id),
+				util::up_next_line(queue->tracks, queue->current_track_id),
+				footer);
+
+			SABER_TRY(bot.http()
+						  .create_message(message.channel_id)
+						  .embeds({std::move(embed)})
+						  .reply(message.id)
+						  .send(yield));
+			return outcome::success();
+		}
+
+		auto embed = util::music_action_embed(
+			"Skipped", util::k_color_ok, "Moved to the next track.",
+			util::now_playing_line(queue->tracks, queue->current_track_id),
+			util::up_next_line(queue->tracks, queue->current_track_id), footer);
+
+		SABER_TRY(bot.http()
+					  .create_message(message.channel_id)
+					  .embeds({std::move(embed)})
+					  .reply(message.id)
+					  .send(yield));
+
 		return outcome::success();
 	}
 };

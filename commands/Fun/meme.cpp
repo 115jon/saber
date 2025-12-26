@@ -1,4 +1,3 @@
-#include <ekizu/embed_builder.hpp>
 #include <ekizu/http.hpp>
 #include <nlohmann/json.hpp>
 #include <saber/saber.hpp>

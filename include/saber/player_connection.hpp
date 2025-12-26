@@ -7,7 +7,6 @@
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <ekizu/voice_connection.hpp>
-#include <queue>
 #include <saber/guild_queue.hpp>
 #include <saber/result.hpp>
 
@@ -21,8 +20,14 @@ struct PlayerConnection {
 	SABER_EXPORT Result<> pause();
 	SABER_EXPORT Result<> resume();
 
+	// Wakes any paused send() so skip/previous can cancel deterministically.
+	SABER_EXPORT void interrupt_playback();
+
 	SABER_EXPORT Result<> send_track_data(
 		TrackData data, const boost::asio::yield_context &yield);
+
+	SABER_EXPORT Result<> stop_speaking(
+		const boost::asio::yield_context &yield);
 
 	void shutdown();
 	bool is_shutdown() const {
@@ -48,7 +53,6 @@ struct PlayerConnection {
 	ekizu::VoiceConnectionConfig m_config;
 	std::function<void(ekizu::Log)> m_on_log;
 	std::optional<ekizu::VoiceConnection> m_voice_connection;
-	std::map<uint64_t, std::queue<TrackData>> m_pending_tracks;
 
 	std::optional<boost::asio::steady_timer> m_task_timer;
 	std::optional<boost::asio::steady_timer> m_pause_timer;
@@ -56,6 +60,7 @@ struct PlayerConnection {
 	uint64_t m_tasks{};
 	bool m_speaking{};
 	std::atomic<bool> m_shutdown{false};
+	std::atomic<bool> m_interrupted{false};
 };
 
 }  // namespace saber
