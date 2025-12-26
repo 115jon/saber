@@ -4,6 +4,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <ekizu/http_client.hpp>
 #include <ekizu/lru_cache.hpp>
@@ -140,6 +141,7 @@ struct Saber {
 							  std::vector<std::shared_ptr<ComponentCollector>>>
 		m_collectors;
 	Player m_player;
+	std::atomic<bool> m_restore_started{false};
 	bool m_running{true};
 };
 }  // namespace saber

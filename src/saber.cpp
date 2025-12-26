@@ -192,6 +192,21 @@ void Saber::run(const boost::asio::yield_context &yield) {
 			m_shard.get_executor(),
 			[this, ev = std::move(res.value())](const auto &y) {
 				handle_event(ev, y);
+
+				bool expected = false;
+				if (m_restore_started.compare_exchange_strong(expected, true)) {
+					boost::asio::spawn(
+						y.get_executor(),
+						[this](const auto &y) {
+							auto r = m_player.restore_all(y);
+							if (!r) {
+								log<ekizu::LogLevel::Error>(
+									"Player restore_all failed: {}",
+									r.error().message());
+							}
+						},
+						boost::asio::detached);
+				}
 			},
 			boost::asio::detached);
 	}
@@ -333,7 +348,10 @@ void Saber::handle_event(ekizu::Event ev,
 				};
 			},
 			[this](ekizu::Resumed) { log<ekizu::LogLevel::Info>("Resumed"); },
-			[](const auto & /*e*/) {}},
+			[this](const auto &e) {
+				log<ekizu::LogLevel::Warn>(
+					"Unhandled event: {}", nlohmann::json{e}.dump());
+			}},
 		ev);
 }
 }  // namespace saber

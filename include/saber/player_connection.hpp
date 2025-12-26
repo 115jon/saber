@@ -60,6 +60,7 @@ struct PlayerConnection {
 	uint64_t m_tasks{};
 	bool m_speaking{};
 	std::atomic<bool> m_shutdown{false};
+	std::atomic<bool> m_paused{false};
 	std::atomic<bool> m_interrupted{false};
 };
 

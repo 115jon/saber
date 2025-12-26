@@ -17,8 +17,11 @@ Result<> PlayerConnection::pause() {
 	if (m_shutdown.load(std::memory_order_acquire)) {
 		return boost::system::errc::operation_canceled;
 	}
+	m_paused.store(true, std::memory_order_release);
 	if (m_pause_timer) {
 		m_pause_timer->expires_at(std::chrono::steady_clock::time_point::max());
+		// Wake any in-flight wait so send() can observe the new paused state.
+		m_pause_timer->cancel();
 		log<ekizu::LogLevel::Info>("Playback paused");
 	}
 	return outcome::success();
@@ -28,8 +31,11 @@ Result<> PlayerConnection::resume() {
 	if (m_shutdown.load(std::memory_order_acquire)) {
 		return boost::system::errc::operation_canceled;
 	}
+	m_paused.store(false, std::memory_order_release);
 	if (m_pause_timer) {
 		m_pause_timer->expires_at(std::chrono::steady_clock::time_point::min());
+		// Wake any in-flight wait so send() can observe the new paused state.
+		m_pause_timer->cancel();
 		log<ekizu::LogLevel::Info>("Playback resumed");
 	}
 	return outcome::success();
@@ -95,7 +101,13 @@ Result<> PlayerConnection::send_track_data(TrackData data,
 
 	if (!m_pause_timer) {
 		m_pause_timer.emplace(yield.get_executor());
-		m_pause_timer->expires_at(std::chrono::steady_clock::time_point::min());
+		if (m_paused.load(std::memory_order_acquire)) {
+			m_pause_timer->expires_at(
+				std::chrono::steady_clock::time_point::max());
+		} else {
+			m_pause_timer->expires_at(
+				std::chrono::steady_clock::time_point::min());
+		}
 	}
 
 	if (data.data.empty() && !data.finished) { return outcome::success(); }
@@ -203,30 +215,34 @@ Result<> PlayerConnection::send(const TrackData &data,
 	}
 
 	if (m_pause_timer) {
-		boost::system::error_code ec;
-		m_pause_timer->async_wait(yield[ec]);
+		while (m_paused.load(std::memory_order_acquire)) {
+			boost::system::error_code ec;
+			m_pause_timer->async_wait(yield[ec]);
 
-		if (ec == asio::error::operation_aborted) {
-			// If cancelled due to shutdown, return immediately
+			if (ec == asio::error::operation_aborted) {
+				// If cancelled due to shutdown, return immediately
+				if (m_shutdown.load(std::memory_order_acquire)) {
+					return boost::system::errc::operation_canceled;
+				}
+
+				// If interrupted (skip/previous while paused), do not send any
+				// audio; unwind to let the Player switch tracks.
+				if (m_interrupted.exchange(false, std::memory_order_acq_rel)) {
+					return boost::system::errc::operation_canceled;
+				}
+
+				// pause()/resume() uses timer cancellation to wake this wait.
+				// Loop and re-check m_paused to decide whether to keep waiting
+				// or proceed.
+				continue;
+			}
+
+			if (ec) { return ec; }
+
+			// Check if we were shut down while waiting
 			if (m_shutdown.load(std::memory_order_acquire)) {
 				return boost::system::errc::operation_canceled;
 			}
-
-			// If interrupted (skip/previous while paused), do not send any
-			// audio; unwind to let the Player switch tracks.
-			if (m_interrupted.exchange(false, std::memory_order_acq_rel)) {
-				return boost::system::errc::operation_canceled;
-			}
-
-			// Defensive: treat unexpected cancellations as a cancel signal.
-			return boost::system::errc::operation_canceled;
-		}
-
-		if (ec) { return ec; }
-
-		// Check if we were shut down while waiting
-		if (m_shutdown.load(std::memory_order_acquire)) {
-			return boost::system::errc::operation_canceled;
 		}
 	}
 
