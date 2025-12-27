@@ -57,6 +57,30 @@ struct Player {
 	[[nodiscard]] SABER_EXPORT Result<> set_volume(ekizu::Snowflake guild_id,
 												   float scalar);
 
+	// Fade is applied at the start/end of tracks.
+	// Note: changing this while a track is playing may only affect the next
+	// track, because end-of-track fade-out requires buffering.
+	[[nodiscard]] SABER_EXPORT Result<int> fade_ms(
+		ekizu::Snowflake guild_id) const;
+	[[nodiscard]] SABER_EXPORT Result<> set_fade_ms(ekizu::Snowflake guild_id,
+													int ms);
+
+	[[nodiscard]] SABER_EXPORT Result<bool> limiter_enabled(
+		ekizu::Snowflake guild_id) const;
+	[[nodiscard]] SABER_EXPORT Result<> set_limiter_enabled(
+		ekizu::Snowflake guild_id, bool enabled);
+
+	// Threshold in dBFS, typically negative (e.g. -1.0).
+	[[nodiscard]] SABER_EXPORT Result<float> limiter_threshold_db(
+		ekizu::Snowflake guild_id) const;
+	[[nodiscard]] SABER_EXPORT Result<> set_limiter_threshold_db(
+		ekizu::Snowflake guild_id, float db);
+
+	[[nodiscard]] SABER_EXPORT Result<int> limiter_release_ms(
+		ekizu::Snowflake guild_id) const;
+	[[nodiscard]] SABER_EXPORT Result<> set_limiter_release_ms(
+		ekizu::Snowflake guild_id, int ms);
+
 	[[nodiscard]] SABER_EXPORT Result<> restore_all(
 		const boost::asio::yield_context &yield);
 
@@ -75,7 +99,17 @@ struct Player {
 		std::chrono::steady_clock::duration paused_total{};
 		std::optional<std::chrono::steady_clock::time_point> pause_started;
 		std::shared_ptr<StreamResources> active_stream;
+
+		// Shared so unordered_map rehash/move cannot invalidate atomics.
 		std::shared_ptr<std::atomic<float>> volume;
+		std::shared_ptr<std::atomic<int>> fade_ms;
+		std::shared_ptr<std::atomic<bool>> limiter_enabled;
+		std::shared_ptr<std::atomic<float>> limiter_threshold_db;
+		std::shared_ptr<std::atomic<int>> limiter_release_ms;
+
+		// Per-track runtime state.
+		uint64_t frames_sent{};
+		float limiter_gain{1.0F};
 	};
 
 	struct TrackMetadata {
@@ -92,6 +126,9 @@ struct Player {
 	};
 
 	static float clamp_volume(float v);
+	static int clamp_fade_ms(int ms);
+	static float clamp_limiter_threshold_db(float db);
+	static int clamp_limiter_release_ms(int ms);
 
 	void mark_persist_dirty(ekizu::Snowflake guild_id);
 	[[nodiscard]] std::string build_persist_json(
