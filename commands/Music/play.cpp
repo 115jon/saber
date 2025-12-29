@@ -1,5 +1,7 @@
 #include <boost/algorithm/string/join.hpp>
+#include <ekizu/message.hpp>
 #include <saber/util.hpp>
+#include <type_traits>
 
 using namespace saber;
 
@@ -57,9 +59,7 @@ struct Play : Command {
 					  "**✅ Added to queue**\n{}\n`{}`", display, track.id)
 				: fmt::format("**▶️ Started playing**\n{}", display);
 
-		auto embed = ekizu::EmbedBuilder().set_description(description).build();
-
-		// Define buttons
+		// Define buttons (legacy ActionRow inside a Components V2 Container).
 		auto controls =
 			ekizu::ActionRowBuilder()
 				.components(
@@ -80,11 +80,21 @@ struct Play : Command {
 						 .build()})
 				.build();
 
-		// Send the message and capture the result to get the message ID
+		ekizu::TextDisplay status;
+		status.content = std::move(description);
+
+		ekizu::Container container;
+		container.components.emplace_back(std::move(status));
+		container.components.emplace_back(controls);
+
+		// Send the message and capture the result to get the message ID.
+		// NOTE: CreateMessage::components takes a const ref, so this copies.
+		const std::vector<ekizu::MessageComponent> out_components = {container};
+
 		SABER_TRY(auto msg, bot.http()
 								.create_message(message.channel_id)
-								.embeds({std::move(embed)})
-								.components({controls})
+								.flags(ekizu::MessageFlags::IsComponentsV2)
+								.components(out_components)
 								.send(yield));
 
 		// --- Collector Implementation ---
@@ -117,7 +127,7 @@ struct Play : Command {
 
 		// Create collector (Active for 10 minutes)
 		auto collector = bot.create_message_component_collector(
-			message.channel_id, filter, ekizu::ComponentType::Button,
+			message.channel_id, filter, {ekizu::ComponentType::Button},
 			std::chrono::minutes(10), yield);
 
 		bool is_paused = false;
@@ -146,7 +156,7 @@ struct Play : Command {
 		};
 
 		while (true) {
-			auto res = collector->async_receive(yield);
+			auto res = collector.async_receive(yield);
 			if (!res) { break; }  // Timeout or error
 
 			auto &[i, data] = res.value();
@@ -184,14 +194,39 @@ struct Play : Command {
 			}
 		}
 
-		// Cleanup: Disable buttons when collector times out
-		auto &action_row = std::get<ekizu::ActionRow>(msg.components[0]);
-		for (auto &component : action_row.components) {
-			std::visit([](auto &c) { c.disabled = true; }, component);
+		// Cleanup: Disable buttons when collector times out.
+		auto disable_action_row = [](ekizu::ActionRow &row) {
+			for (auto &component : row.components) {
+				std::visit(
+					[](auto &c) {
+						using C = std::decay_t<decltype(c)>;
+						if constexpr (std::is_same_v<C, ekizu::Button>) {
+							c.disabled = true;
+						} else if constexpr (std::is_same_v<
+												 C, ekizu::SelectMenu>) {
+							c.disabled = true;
+						}
+					},
+					component);
+			}
+		};
+
+		for (auto &top : msg.components) {
+			if (auto *ct = std::get_if<ekizu::Container>(&top)) {
+				for (auto &inner : ct->components) {
+					if (auto *row = std::get_if<ekizu::ActionRow>(&inner)) {
+						disable_action_row(*row);
+					}
+				}
+			} else if (auto *row = std::get_if<ekizu::ActionRow>(&top)) {
+				// Back-compat: if the API ever returns a top-level ActionRow.
+				disable_action_row(*row);
+			}
 		}
 
 		SABER_TRY(bot.http()
 					  .edit_message(msg.channel_id, msg.id)
+					  .flags(ekizu::MessageFlags::IsComponentsV2)
 					  .components(std::move(msg.components))
 					  .send(yield));
 

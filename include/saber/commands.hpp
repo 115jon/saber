@@ -2,10 +2,17 @@
 #define SABER_COMMANDS_HPP
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <ekizu/application_command.hpp>
+#include <ekizu/application_command_data.hpp>
+#include <ekizu/interaction.hpp>
 #include <ekizu/message.hpp>
 #include <ekizu/permissions.hpp>
 #include <filesystem>  // NOLINT
+#include <optional>
 #include <saber/library.hpp>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace saber {
 struct Command;
@@ -30,6 +37,10 @@ struct CommandLoader {
 
 	[[nodiscard]] SABER_EXPORT Result<> process_commands(
 		const ekizu::Message &message, const boost::asio::yield_context &yield);
+
+	[[nodiscard]] SABER_EXPORT Result<> process_commands(
+		const ekizu::Interaction &interaction,
+		const boost::asio::yield_context &yield);
 
 	SABER_EXPORT void unload(const std::string &name);
 
@@ -61,9 +72,8 @@ struct CommandOptions {
 	bool enabled{};
 	bool init{};
 	bool guild_only{};
-	bool slash{};
 	bool user{};
-	// std::optional<std::vector<ApplicationCommandOption>> options;
+	std::optional<std::vector<ekizu::ApplicationCommandOption>> slash_options;
 	std::vector<std::string> aliases;
 	std::string usage;
 	std::string description;
@@ -106,13 +116,14 @@ struct CommandOptionsBuilder {
 		return *this;
 	}
 
-	CommandOptionsBuilder &slash(bool slash) {
-		m_options.slash = slash;
+	CommandOptionsBuilder &user(bool user) {
+		m_options.user = user;
 		return *this;
 	}
 
-	CommandOptionsBuilder &user(bool user) {
-		m_options.user = user;
+	CommandOptionsBuilder &slash_options(
+		std::vector<ekizu::ApplicationCommandOption> slash_options) {
+		m_options.slash_options = std::move(slash_options);
 		return *this;
 	}
 
@@ -185,19 +196,7 @@ struct CommandOptionsBuilder {
 
 struct Command {
 	Command(Saber &instigator, CommandOptions options_)
-		: bot{instigator}, options{std::move(options_)} {
-		// If the command is a slash command, make sure to make the appropriate
-		// JSON data.
-		if (options.slash) {
-			// slash_data.name = options.name;
-			// if (!options.description.empty()) {
-			//     slash_data.description = options.description;
-			// }
-			// if (options.options.has_value() && !options.options->empty()) {
-			//     slash_data.options = options.options;
-			// }
-		}
-	};
+		: bot{instigator}, options{std::move(options_)} {};
 
 	Command(const Command &) = delete;
 	Command &operator=(const Command &) = delete;
@@ -215,6 +214,14 @@ struct Command {
 	[[nodiscard]] virtual Result<> execute(
 		const ekizu::Message &message, const std::vector<std::string> &args,
 		const boost::asio::yield_context &yield) = 0;
+
+	/// Method reserved for interaction commands' execution
+	/// (slash/context/autocomplete).
+	[[nodiscard]] virtual Result<> execute(
+		[[maybe_unused]] const ekizu::Interaction &interaction,
+		[[maybe_unused]] const boost::asio::yield_context &yield) {
+		return ekizu::outcome::success();
+	}
 
 	Saber &bot;
 	CommandOptions options;

@@ -104,16 +104,17 @@ struct Help : Command {
 		};
 
 		auto collector = bot.create_message_component_collector(
-			message.channel_id, filter, ekizu::ComponentType::SelectMenu,
+			message.channel_id, filter, {ekizu::ComponentType::SelectMenu},
 			std::chrono::seconds(30), yield);
 
 		while (true) {
-			auto res = collector->async_receive(yield);
+			auto res = collector.async_receive(yield);
 			if (!res) { break; }
 
 			auto &[i, data] = res.value();
 
-			const auto &values = data.values;
+			const auto &values =
+				data.values.value_or(std::vector<std::string>{});
 			if (values.empty()) { continue; }
 
 			const auto &category = values[0];

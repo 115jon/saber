@@ -13,6 +13,7 @@
 #include <saber/component_collector.hpp>
 #include <saber/config.hpp>
 #include <saber/player.hpp>
+#include <vector>
 
 namespace saber {
 struct Saber {
@@ -80,13 +81,22 @@ struct Saber {
 	[[nodiscard]] SABER_EXPORT Result<> leave_voice_channel(
 		ekizu::Snowflake guild_id, const boost::asio::yield_context &yield);
 
-	SABER_EXPORT std::shared_ptr<ComponentCollector>
+	SABER_EXPORT InteractionCollector<ekizu::MessageComponentData>
 	create_message_component_collector(
 		ekizu::Snowflake channel_id,
 		std::function<bool(const ekizu::Interaction &,
 						   const ekizu::MessageComponentData &)>
 			filter,
-		ekizu::ComponentType component_type,
+		std::vector<ekizu::ComponentType> component_types,
+		std::chrono::steady_clock::duration expiry,
+		const boost::asio::yield_context &yield);
+
+	SABER_EXPORT InteractionCollector<ekizu::ModalSubmitData>
+	create_modal_submit_collector(
+		ekizu::Snowflake channel_id,
+		std::function<bool(const ekizu::Interaction &,
+						   const ekizu::ModalSubmitData &)>
+			filter,
 		std::chrono::steady_clock::duration expiry,
 		const boost::asio::yield_context &yield);
 

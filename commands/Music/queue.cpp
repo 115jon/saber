@@ -177,11 +177,11 @@ struct Queue : Command {
 		};
 
 		auto collector = bot.create_message_component_collector(
-			message.channel_id, filter, ekizu::ComponentType::Button,
+			message.channel_id, filter, {ekizu::ComponentType::Button},
 			k_collector_lifetime, yield);
 
 		while (true) {
-			auto res = collector->async_receive(yield);
+			auto res = collector.async_receive(yield);
 			if (!res) { break; }
 
 			auto [i, data] = res.value();

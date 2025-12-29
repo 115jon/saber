@@ -13,6 +13,35 @@ struct overload : Func... {
 
 template <typename... Func>
 overload(Func...) -> overload<Func...>;
+
+using namespace saber;
+
+std::shared_ptr<ComponentCollector> create_collector_impl(
+	std::vector<std::shared_ptr<ComponentCollector>> &list,
+	std::vector<ekizu::ComponentType> component_types,
+	std::chrono::steady_clock::duration expiry,
+	std::function<bool(const ekizu::Interaction &,
+					   const ComponentCollector::CollectedComponentData &)>
+		filter,
+	const boost::asio::yield_context &yield) {
+	// LAZY CLEANUP: Remove collectors that have finished
+	list.erase(
+		std::remove_if(list.begin(), list.end(),
+					   [](const std::shared_ptr<ComponentCollector> &ptr) {
+						   return ptr->is_finished();
+					   }),
+		list.end());
+
+	// 1. Allocate on Heap
+	auto collector = std::make_shared<ComponentCollector>(
+		std::move(component_types), expiry, std::move(filter), yield);
+	collector->start();
+
+	// 2. Add to vector
+	list.push_back(collector);
+
+	return collector;
+}
 }  // namespace
 
 namespace saber {
@@ -136,35 +165,54 @@ Result<> Saber::leave_voice_channel(ekizu::Snowflake guild_id,
 	return m_shard.leave_voice_channel(guild_id, yield);
 }
 
-std::shared_ptr<ComponentCollector> Saber::create_message_component_collector(
+InteractionCollector<ekizu::MessageComponentData>
+Saber::create_message_component_collector(
 	ekizu::Snowflake channel_id,
 	std::function<bool(const ekizu::Interaction &,
 					   const ekizu::MessageComponentData &)>
 		filter,
-	ekizu::ComponentType component_type,
+	std::vector<ekizu::ComponentType> component_types,
 	std::chrono::steady_clock::duration expiry,
 	const boost::asio::yield_context &yield) {
-	auto &list = m_collectors[channel_id];
+	auto safe_filter =
+		[fn = std::move(filter)](
+			const ekizu::Interaction &interaction,
+			const ComponentCollector::CollectedComponentData &data) -> bool {
+		if (const auto *val = std::get_if<ekizu::MessageComponentData>(&data)) {
+			return fn(interaction, *val);
+		}
+		return false;
+	};
 
-	// LAZY CLEANUP: Remove collectors that have finished (timer expired or
-	// closed) This prevents the vector from growing infinitely.
-	list.erase(
-		std::remove_if(list.begin(), list.end(),
-					   [](const std::shared_ptr<ComponentCollector> &ptr) {
-						   return ptr->is_finished();
-					   }),
-		list.end());
+	auto internal = create_collector_impl(
+		m_collectors[channel_id], std::move(component_types), expiry,
+		std::move(safe_filter), yield);
 
-	// 1. Allocate on Heap
-	// Using shared_ptr ensures the ComponentCollector object stays at a
-	// fixed memory address even if the vector 'list' resizes.
-	auto collector = std::make_shared<ComponentCollector>(
-		component_type, expiry, std::move(filter), yield);
+	return InteractionCollector<ekizu::MessageComponentData>(internal);
+}
 
-	// 2. Add to vector
-	list.push_back(collector);
+InteractionCollector<ekizu::ModalSubmitData>
+Saber::create_modal_submit_collector(
+	ekizu::Snowflake channel_id,
+	std::function<bool(const ekizu::Interaction &,
+					   const ekizu::ModalSubmitData &)>
+		filter,
+	std::chrono::steady_clock::duration expiry,
+	const boost::asio::yield_context &yield) {
+	auto safe_filter =
+		[fn = std::move(filter)](
+			const ekizu::Interaction &interaction,
+			const ComponentCollector::CollectedComponentData &data) -> bool {
+		if (const auto *val = std::get_if<ekizu::ModalSubmitData>(&data)) {
+			return fn(interaction, *val);
+		}
+		return false;
+	};
 
-	return collector;
+	auto internal = create_collector_impl(
+		m_collectors[channel_id], {}, expiry, std::move(safe_filter), yield);
+
+	return InteractionCollector<ekizu::ModalSubmitData>(internal);
 }
 
 void Saber::run(const boost::asio::yield_context &yield) {
@@ -309,6 +357,15 @@ void Saber::handle_event(ekizu::Event ev,
 						collector->async_send(interaction, yield);
 					}
 				}
+
+				if (const auto res =
+						m_commands.process_commands(interaction, yield);
+					!res && res.error().failed()) {
+					log<ekizu::LogLevel::Warn>(
+						"Failed to process interaction: {{message={}, "
+						"context={}}}",
+						res.error().message(), ekizu::last_error_context());
+				};
 			},
 			[this](const ekizu::VoiceStateUpdate &v) {
 				if (v.voice_state.guild_id) {
@@ -344,13 +401,14 @@ void Saber::handle_event(ekizu::Event ev,
 						m_commands.process_commands(m.message, yield);
 					!res && res.error().failed()) {
 					log<ekizu::LogLevel::Warn>(
-						"Failed to process command: {}", res.error().message());
+						"Failed to process command: {{message={}, context={}}}",
+						res.error().message(), ekizu::last_error_context());
 				};
 			},
 			[this](ekizu::Resumed) { log<ekizu::LogLevel::Info>("Resumed"); },
 			[this](const auto &e) {
-				log<ekizu::LogLevel::Warn>(
-					"Unhandled event: {}", nlohmann::json{e}.dump());
+				// log<ekizu::LogLevel::Warn>(
+				// 	"Unhandled event: {}", nlohmann::json{e}.dump());
 			}},
 		ev);
 }
