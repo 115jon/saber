@@ -1,1375 +1,259 @@
-#include <opus/opus.h>
-#include <spdlog/spdlog.h>
-
-// clang-format off
-#include "fixed_utf8.hpp" // NOLINT
-// clang-format on
-
-#include <algorithm>
-#include <array>
-#include <boost/algorithm/string.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/experimental/channel.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/process/v2.hpp>
-#include <boost/scope_exit.hpp>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <deque>
-#include <filesystem>
-#include <fstream>
-#include <nlohmann/json.hpp>
-#include <saber/audio_dsp.hpp>
+#include <boost/asio/spawn.hpp>
 #include <saber/player.hpp>
-#include <saber/ring_buffer.hpp>
-#include <utility>
-#include <vector>
-
-namespace asio = boost::asio;
-namespace bp = boost::process::v2;
 
 namespace saber {
 
-struct Player::StreamResources {
-	explicit StreamResources(const asio::any_io_executor &ex,
-							 const bp::filesystem::path &exe,
-							 const std::vector<std::string> &args)
-		: rp{ex}, ep{ex}, proc{ex, exe, args, bp::process_stdio{{}, rp, ep}} {}
+Player::Player(Connector connector) : m_connector(std::move(connector)) {}
 
-	void cancel() {
-		boost::system::error_code ignored;
-		rp.cancel(ignored);
-		ep.cancel(ignored);
-		rp.close(ignored);
-		ep.close(ignored);
-		proc.request_exit(ignored);
-		proc.terminate(ignored);
-	}
-
-	asio::readable_pipe rp;
-	asio::readable_pipe ep;
-	bp::process proc;
-};
-
-static constexpr auto k_previous_restart_threshold = std::chrono::seconds(5);
-
-namespace {
-
-std::string trim_copy(std::string s) {
-	boost::algorithm::trim(s);
-	return s;
+bool Player::has_connection(ekizu::Snowflake guild_id) const {
+	return m_state_mgr.has_connection(guild_id);
 }
 
-std::string make_search_arg(std::string_view query) {
-	if (boost::algorithm::starts_with(query, "http")) {
-		return std::string{query};
-	}
-	return fmt::format("ytsearch1:{}", query);
-}
-
-Result<std::string> read_process_stdout(
-	bp::process &proc, asio::readable_pipe &rp, asio::readable_pipe &ep,
-	const asio::yield_context &yield) {
-	asio::spawn(
-		yield.get_executor(),
-		[&ep](const auto &y) mutable {
-			auto buf = std::make_shared<std::array<char, 4096>>();
-			boost::system::error_code ignore;
-			while (true) {
-				size_t n = ep.async_read_some(asio::buffer(*buf), y[ignore]);
-				if (ignore || n == 0) { break; }
-			}
-		},
-		asio::detached);
-
-	boost::system::error_code ec;
-	std::string out;
-	out.reserve(8192);
-	std::array<char, 4096> chunk{};
-
-	while (true) {
-		auto n = rp.async_read_some(asio::buffer(chunk), yield[ec]);
-		if (n > 0) { out.append(chunk.data(), n); }
-		if (ec) { break; }
-	}
-
-	if (ec && ec != asio::error::eof && ec != asio::error::broken_pipe) {
-		return ec;
-	}
-
-	(void)proc.async_wait(yield[ec]);
-	if (ec) { return ec; }
-
-	return outcome::success(out);
-}
-
-std::vector<std::string> split_lines_nonempty(const std::string &s) {
-	std::vector<std::string> lines;
-	lines.reserve(32);	// Typical case: avoid reallocations
-
-	boost::algorithm::split(lines, s, boost::algorithm::is_any_of("\r\n"),
-							boost::algorithm::token_compress_on);
-
-	lines.erase(std::remove_if(lines.begin(), lines.end(),
-							   [](std::string &line) {
-								   boost::algorithm::trim(line);
-								   return line.empty();
-							   }),
-				lines.end());
-
-	return lines;
-}
-
-const std::filesystem::path k_player_state_dir = "saber_player_state";
-
-std::filesystem::path state_file_path(ekizu::Snowflake guild_id) {
-	return k_player_state_dir / fmt::format("{}.json", guild_id);
-}
-
-std::filesystem::path state_tmp_file_path(ekizu::Snowflake guild_id) {
-	return k_player_state_dir / fmt::format("{}.json.tmp", guild_id);
-}
-
-void write_file_atomic(const std::filesystem::path &final_path,
-					   const std::filesystem::path &tmp_path,
-					   std::string_view data) {
-	std::error_code ec;
-	std::filesystem::create_directories(final_path.parent_path(), ec);
-	{
-		std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-		if (!out) { return; }
-		out.write(data.data(), static_cast<std::streamsize>(data.size()));
-		out.flush();
-	}
-	std::filesystem::remove(final_path, ec);
-	std::filesystem::rename(tmp_path, final_path, ec);
-}
-
-}  // namespace
-
-Player::Player(Connector connector)
-	: m_connector(std::move(connector)), m_persist_pool(1) {}
-
-namespace {
-template <typename T>
-T clamp_value(T value, T min_val, T max_val, T default_val) {
-	if constexpr (std::is_floating_point_v<T>) {
-		if (!std::isfinite(value)) { return default_val; }
-	}
-	return std::clamp(value, min_val, max_val);
-}
-}  // namespace
-
-float Player::clamp_volume(float v) { return clamp_value(v, 0.0F, 2.0F, 1.0F); }
-
-int Player::clamp_fade_ms(int ms) { return clamp_value(ms, 0, 2000, 120); }
-
-float Player::clamp_limiter_threshold_db(float db) {
-	return clamp_value(db, -30.0F, 0.0F, -1.0F);
-}
-
-int Player::clamp_limiter_release_ms(int ms) {
-	return clamp_value(ms, 0, 2000, 120);
-}
-
-[[nodiscard]] bool Player::has_connection(ekizu::Snowflake guild_id) const {
-	return m_connections.contains(guild_id);
-}
-
-[[nodiscard]] bool Player::has_queue(ekizu::Snowflake guild_id) const {
-	return m_queues.contains(guild_id);
+bool Player::has_queue(ekizu::Snowflake guild_id) const {
+	return m_state_mgr.has_queue(guild_id);
 }
 
 Result<ekizu::Snowflake> Player::voice_channel_id(
 	ekizu::Snowflake guild_id) const {
-	auto it = m_last_voice_channel.find(guild_id);
-	if (it == m_last_voice_channel.end()) {
+	const auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->last_voice_channel) {
 		return boost::system::errc::operation_not_permitted;
 	}
-	return outcome::success(it->second);
-}
-
-Result<float> Player::volume(ekizu::Snowflake guild_id) const {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	return outcome::success(
-		st_it->second.volume.load(std::memory_order_acquire));
-}
-
-Result<> Player::set_volume(ekizu::Snowflake guild_id, float scalar) {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	scalar = clamp_volume(scalar);
-	st_it->second.volume.store(scalar, std::memory_order_release);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
-}
-
-Result<int> Player::fade_ms(ekizu::Snowflake guild_id) const {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	return outcome::success(
-		st_it->second.fade_ms.load(std::memory_order_acquire));
-}
-
-Result<> Player::set_fade_ms(ekizu::Snowflake guild_id, int ms) {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	ms = clamp_fade_ms(ms);
-	st_it->second.fade_ms.store(ms, std::memory_order_release);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
-}
-
-Result<bool> Player::limiter_enabled(ekizu::Snowflake guild_id) const {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	return outcome::success(
-		st_it->second.limiter_enabled.load(std::memory_order_acquire));
-}
-
-Result<> Player::set_limiter_enabled(ekizu::Snowflake guild_id, bool enabled) {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	st_it->second.limiter_enabled.store(enabled, std::memory_order_release);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
-}
-
-Result<float> Player::limiter_threshold_db(ekizu::Snowflake guild_id) const {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	return outcome::success(
-		st_it->second.limiter_threshold_db.load(std::memory_order_acquire));
-}
-
-Result<> Player::set_limiter_threshold_db(ekizu::Snowflake guild_id, float db) {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	db = clamp_limiter_threshold_db(db);
-	st_it->second.limiter_threshold_db.store(db, std::memory_order_release);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
-}
-
-Result<int> Player::limiter_release_ms(ekizu::Snowflake guild_id) const {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	return outcome::success(
-		st_it->second.limiter_release_ms.load(std::memory_order_acquire));
-}
-
-Result<> Player::set_limiter_release_ms(ekizu::Snowflake guild_id, int ms) {
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	ms = clamp_limiter_release_ms(ms);
-	st_it->second.limiter_release_ms.store(ms, std::memory_order_release);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
-}
-
-Result<> Player::restore_all(const asio::yield_context &yield) {
-	return restore_all_impl(yield);
+	return *state->last_voice_channel;
 }
 
 Result<GuildQueue *> Player::queue(ekizu::Snowflake guild_id) {
-	auto it = m_queues.find(guild_id);
-	if (it == m_queues.end()) {
-		return outcome::failure(boost::system::errc::operation_not_permitted);
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->queue) {
+		return boost::system::errc::operation_not_permitted;
 	}
-	return outcome::success(it->second.get());
+	return state->queue.get();
 }
 
 Result<bool> Player::connect(ekizu::Snowflake guild_id,
 							 ekizu::Snowflake channel_id,
 							 const asio::yield_context &yield) {
-	if (m_connections.contains(guild_id)) { return false; }
+	if (m_state_mgr.has_connection(guild_id)) { return false; }
 
-	m_last_voice_channel[guild_id] = channel_id;
+	auto *state = m_state_mgr.get_or_create(guild_id);
+	state->last_voice_channel = channel_id;
 
-	log<ekizu::LogLevel::Info>("Player connecting to guild {}", guild_id);
+	log<ekizu::LogLevel::Info>("Connecting to guild {}", guild_id);
 	SABER_TRY(auto config, m_connector(guild_id, channel_id, yield));
 
-	if (!m_queues.contains(guild_id)) {
-		m_queues.emplace(
-			guild_id, std::make_unique<GuildQueue>([this](ekizu::Log l) {
-				if (m_on_log) { m_on_log(std::move(l)); }
-			}));
-	}
-
-	m_connections.emplace(
-		guild_id, std::make_unique<PlayerConnection>(
-					  *config, m_queues[guild_id].get(), [this](ekizu::Log l) {
-						  if (m_on_log) { m_on_log(std::move(l)); }
-					  }));
-
-	(void)m_playback[guild_id];
-	mark_persist_dirty(guild_id);
-	return true;
-}
-
-std::string Player::build_persist_json(ekizu::Snowflake guild_id) const {
-	nlohmann::json root = nlohmann::json::object();
-	root["guild_id"] = guild_id;
-
-	auto vc_it = m_last_voice_channel.find(guild_id);
-	if (vc_it != m_last_voice_channel.end()) {
-		root["voice_channel_id"] = vc_it->second;
-	}
-
-	auto pb_it = m_playback.find(guild_id);
-	if (pb_it != m_playback.end()) {
-		const auto &st = pb_it->second;
-		root["paused"] = st.paused;
-		root["volume"] = st.volume.load(std::memory_order_acquire);
-		root["fade_ms"] = st.fade_ms.load(std::memory_order_acquire);
-		root["limiter_enabled"] =
-			st.limiter_enabled.load(std::memory_order_acquire);
-		root["limiter_threshold_db"] =
-			st.limiter_threshold_db.load(std::memory_order_acquire);
-		root["limiter_release_ms"] =
-			st.limiter_release_ms.load(std::memory_order_acquire);
-	} else {
-		root["paused"] = false;
-		root["volume"] = 1.0F;
-		root["fade_ms"] = 120;
-		root["limiter_enabled"] = true;
-		root["limiter_threshold_db"] = -1.0F;
-		root["limiter_release_ms"] = 120;
-	}
-
-	auto q_it = m_queues.find(guild_id);
-	if (q_it != m_queues.end() && q_it->second) {
-		const auto &q = *q_it->second;
-		nlohmann::json qj = nlohmann::json::object();
-
-		if (q.current_track_id) {
-			qj["current_track_id"] = *q.current_track_id;
-		} else {
-			qj["current_track_id"] = nullptr;
-		}
-		qj["last_track_id"] = q.last_track_id;
-
-		nlohmann::json tracks = nlohmann::json::array();
-		if (q.current_track_id) {
-			auto it = std::find_if(
-				q.tracks.begin(), q.tracks.end(),
-				[&](const Track &t) { return t.id == *q.current_track_id; });
-			if (it == q.tracks.end()) { it = q.tracks.begin(); }
-
-			size_t count = 0;
-			for (; it != q.tracks.end() && count < k_persist_track_cap;
-				 ++it, ++count) {
-				nlohmann::json tj = nlohmann::json::object();
-				tj["id"] = it->id;
-				tj["requester_id"] = it->requester_id;
-				tj["webpage_url"] = it->webpage_url;
-				tj["title"] = it->title;
-				tracks.emplace_back(std::move(tj));
-			}
-		}
-
-		qj["tracks"] = std::move(tracks);
-		root["queue"] = std::move(qj);
-	}
-
-	return root.dump();
-}
-
-void Player::mark_persist_dirty(ekizu::Snowflake guild_id) {
-	if (m_persist_disabled.load(std::memory_order_acquire)) { return; }
-
-	auto json = build_persist_json(guild_id);
-	bool should_schedule = false;
-	{
-		std::lock_guard<std::mutex> lock(m_persist_mutex);
-		auto &e = m_persist_entries[guild_id];
-		e.latest_json = std::move(json);
-		++e.generation;
-		if (!e.scheduled) {
-			e.scheduled = true;
-			should_schedule = true;
-		}
-	}
-
-	if (should_schedule) {
-		asio::post(
-			m_persist_pool, [this, guild_id] { persist_worker(guild_id); });
-	}
-}
-
-void Player::persist_worker(ekizu::Snowflake guild_id) {
-	if (m_persist_disabled.load(std::memory_order_acquire)) { return; }
-
-	std::string json;
-	uint64_t wrote_gen = 0;
-	{
-		std::lock_guard<std::mutex> lock(m_persist_mutex);
-		auto it = m_persist_entries.find(guild_id);
-		if (it == m_persist_entries.end()) { return; }
-		json = it->second.latest_json;
-		wrote_gen = it->second.generation;
-	}
-
-	write_file_atomic(
-		state_file_path(guild_id), state_tmp_file_path(guild_id), json);
-
-	bool reschedule = false;
-	{
-		std::lock_guard<std::mutex> lock(m_persist_mutex);
-		auto it = m_persist_entries.find(guild_id);
-		if (it == m_persist_entries.end()) { return; }
-		if (it->second.generation == wrote_gen) {
-			it->second.scheduled = false;
-			return;
-		}
-		reschedule = true;
-	}
-
-	if (reschedule && !m_persist_disabled.load(std::memory_order_acquire)) {
-		asio::post(
-			m_persist_pool, [this, guild_id] { persist_worker(guild_id); });
-	}
-}
-
-Result<> Player::restore_all_impl(const asio::yield_context &yield) {
-	using Channel = boost::asio::experimental::channel<void(
-		boost::system::error_code, std::vector<nlohmann::json>)>;
-
-	auto ch = std::make_shared<Channel>(yield.get_executor(), 1);
-
-	asio::post(m_persist_pool, [ch, ex = yield.get_executor()] {
-		std::vector<nlohmann::json> out;
-		out.reserve(64);
-
-		std::error_code ec;
-		if (std::filesystem::exists(k_player_state_dir, ec)) {
-			for (const auto &ent :
-				 std::filesystem::directory_iterator(k_player_state_dir, ec)) {
-				if (ec) { break; }
-				if (!ent.is_regular_file()) { continue; }
-				if (ent.path().extension() != ".json") { continue; }
-				try {
-					std::ifstream in(ent.path());
-					if (!in) { continue; }
-					nlohmann::json j;
-					in >> j;
-					out.emplace_back(std::move(j));
-				} catch (...) { continue; }
-			}
-		}
-
-		asio::post(ex, [ch, out = std::move(out)]() mutable {
-			boost::system::error_code ignored;
-			ch->async_send(ignored, std::move(out), [](const auto &) {});
+	if (!state->queue) {
+		state->queue = std::make_unique<GuildQueue>([this](ekizu::Log l) {
+			if (m_logger) { m_logger(std::move(l)); }
 		});
-	});
-
-	boost::system::error_code ec;
-	auto files = ch->async_receive(yield[ec]);
-	if (ec) { return ec; }
-
-	for (auto &j : files) {
-		if (!j.is_object() || !j.contains("guild_id")) { continue; }
-		ekizu::Snowflake guild_id{};
-		try {
-			guild_id = j["guild_id"].get<ekizu::Snowflake>();
-		} catch (...) { continue; }
-
-		bool paused = j.value("paused", false);
-		float vol = clamp_volume(j.value("volume", 1.0F));
-		int fade = clamp_fade_ms(j.value("fade_ms", 120));
-		bool lim_en = j.value("limiter_enabled", true);
-		float lim_db =
-			clamp_limiter_threshold_db(j.value("limiter_threshold_db", -1.0F));
-		int lim_rel =
-			clamp_limiter_release_ms(j.value("limiter_release_ms", 120));
-
-		if (auto it = j.find("voice_channel_id");
-			it != j.end() && !it->is_null()) {
-			m_last_voice_channel[guild_id] = it->get<ekizu::Snowflake>();
-		}
-
-		if (auto q_it = j.find("queue"); q_it != j.end() && q_it->is_object()) {
-			if (!m_queues.contains(guild_id)) {
-				m_queues.emplace(
-					guild_id,
-					std::make_unique<GuildQueue>([this](ekizu::Log l) {
-						if (m_on_log) { m_on_log(std::move(l)); }
-					}));
-			}
-			auto *q = m_queues[guild_id].get();
-			q->tracks.clear();
-			q->last_track_id = q_it->value("last_track_id", uint64_t{});
-			if (q_it->contains("current_track_id") &&
-				!(*q_it)["current_track_id"].is_null()) {
-				q->current_track_id =
-					(*q_it)["current_track_id"].get<uint64_t>();
-			} else {
-				q->current_track_id.reset();
-			}
-			if (q_it->contains("tracks") && (*q_it)["tracks"].is_array()) {
-				for (const auto &tj : (*q_it)["tracks"]) {
-					Track t;
-					t.id = tj.value("id", uint64_t{});
-					if (tj.contains("requester_id")) {
-						t.requester_id =
-							tj["requester_id"].get<ekizu::Snowflake>();
-					}
-					t.webpage_url = tj.value("webpage_url", std::string{});
-					t.title = tj.value("title", std::string{});
-					t.stream_url.clear();
-					q->tracks.emplace_back(std::move(t));
-				}
-			}
-		}
-
-		auto &st = m_playback[guild_id];
-		st.paused = paused;
-		st.pause_started.reset();
-		st.paused_total = std::chrono::steady_clock::duration::zero();
-		st.volume.store(vol, std::memory_order_release);
-		st.fade_ms.store(fade, std::memory_order_release);
-		st.limiter_enabled.store(lim_en, std::memory_order_release);
-		st.limiter_threshold_db.store(lim_db, std::memory_order_release);
-		st.limiter_release_ms.store(lim_rel, std::memory_order_release);
-
-		if (m_last_voice_channel.contains(guild_id)) {
-			(void)connect(guild_id, m_last_voice_channel[guild_id], yield);
-		}
-
-		if (m_connections.contains(guild_id) && m_queues.contains(guild_id)) {
-			auto *q = m_queues[guild_id].get();
-			if (q != nullptr && q->current_track_id) {
-				auto &pst = m_playback[guild_id];
-				if (!pst.running) {
-					pst.running = true;
-					asio::spawn(
-						yield,
-						[this, guild_id](const auto &y) {
-							auto res = playback_loop(guild_id, y);
-							if (res.has_error() &&
-								res.error() !=
-									boost::system::errc::operation_canceled) {
-								log<ekizu::LogLevel::Error>(
-									"Playback loop failed for guild {}: {}",
-									guild_id, res.error().message());
-							}
-						},
-						asio::detached);
-				}
-			}
-		}
 	}
 
-	return outcome::success();
-}
+	state->connection = std::make_unique<PlayerConnection>(
+		*config, state->queue.get(), [this](ekizu::Log l) {
+			if (m_logger) { m_logger(std::move(l)); }
+		});
 
-std::chrono::steady_clock::duration Player::playback_elapsed(
-	const PlaybackState &st) const {
-	if (!st.running) { return std::chrono::steady_clock::duration::zero(); }
-
-	auto now = std::chrono::steady_clock::now();
-	auto paused_total = st.paused_total;
-
-	if (st.paused && st.pause_started) {
-		paused_total += (now - *st.pause_started);
-	}
-
-	if (now < st.track_started) {
-		return std::chrono::steady_clock::duration::zero();
-	}
-	return (now - st.track_started) - paused_total;
-}
-
-void Player::cancel_active_stream(ekizu::Snowflake guild_id) {
-	auto it = m_playback.find(guild_id);
-	if (it == m_playback.end()) { return; }
-
-	auto &st = it->second;
-	if (st.active_stream) { st.active_stream->cancel(); }
-
-	auto conn_it = m_connections.find(guild_id);
-	if (conn_it != m_connections.end() && conn_it->second) {
-		conn_it->second->interrupt_playback();
-	}
-}
-
-Result<bool> Player::skip(ekizu::Snowflake guild_id) {
-	auto q_it = m_queues.find(guild_id);
-	auto c_it = m_connections.find(guild_id);
-	if (q_it == m_queues.end() || c_it == m_connections.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	auto *q = q_it->second.get();
-	if ((q == nullptr) || !q->current_track_id) { return false; }
-
-	auto it = std::find_if(
-		q->tracks.begin(), q->tracks.end(),
-		[&](const Track &t) { return t.id == *q->current_track_id; });
-	if (it == q->tracks.end()) { return false; }
-
-	auto next = std::next(it);
-	if (next == q->tracks.end()) { return false; }
-
-	q->current_track_id = next->id;
-	mark_persist_dirty(guild_id);
-	cancel_active_stream(guild_id);
+	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return true;
-}
-
-Result<bool> Player::previous(ekizu::Snowflake guild_id) {
-	auto q_it = m_queues.find(guild_id);
-	auto c_it = m_connections.find(guild_id);
-	if (q_it == m_queues.end() || c_it == m_connections.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	auto *q = q_it->second.get();
-	if ((q == nullptr) || !q->current_track_id) { return false; }
-
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) { return false; }
-
-	auto &st = st_it->second;
-	auto elapsed = playback_elapsed(st);
-
-	if (elapsed < k_previous_restart_threshold) {
-		auto it = std::find_if(
-			q->tracks.begin(), q->tracks.end(),
-			[&](const Track &t) { return t.id == *q->current_track_id; });
-
-		if (it != q->tracks.end() && it != q->tracks.begin()) {
-			auto prev = std::prev(it);
-			q->current_track_id = prev->id;
-		}
-	}
-
-	cancel_active_stream(guild_id);
-	return true;
-}
-
-Result<Player::TrackMetadata> Player::resolve_metadata(
-	std::string_view query, const asio::yield_context &yield) {
-	boost::system::error_code ec;
-
-	auto exe = bp::environment::find_executable("yt-dlp");
-	if (exe.empty()) {
-		log<ekizu::LogLevel::Error>("yt-dlp executable not found");
-		return boost::system::errc::no_such_file_or_directory;
-	}
-
-	const auto search_arg = make_search_arg(query);
-
-	std::vector<std::string> args{
-		"--no-playlist",
-		"--no-warnings",
-		"--encoding",
-		"utf-8",
-		"-O",
-		"webpage_url",
-		"-O",
-		"title",
-		search_arg,
-	};
-
-	asio::readable_pipe rp{yield.get_executor()};
-	asio::readable_pipe ep{yield.get_executor()};
-	bp::process proc{
-		yield.get_executor(), exe, args, bp::process_stdio{{}, rp, ep}};
-
-	SABER_TRY(auto out, read_process_stdout(proc, rp, ep, yield));
-	auto lines = split_lines_nonempty(out);
-
-	if (lines.size() < 2) { return boost::system::errc::no_message_available; }
-
-	TrackMetadata meta;
-	meta.webpage_url = std::move(lines[0]);
-	meta.title = std::move(lines[1]);
-	for (size_t i = 2; i < lines.size(); ++i) {
-		meta.title.append("\n");
-		meta.title.append(lines[i]);
-	}
-
-	return outcome::success(std::move(meta));
 }
 
 Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 						   ekizu::Snowflake requester_id,
 						   const asio::yield_context &yield) {
-	auto conn_it = m_connections.find(guild_id);
-	if (conn_it == m_connections.end()) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->connection || !state->queue) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
-	auto queue_it = m_queues.find(guild_id);
-	if (queue_it == m_queues.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
+	SABER_TRY(auto meta, m_stream_mgr.resolve_metadata(query, yield));
 
-	SABER_TRY(auto meta, resolve_metadata(query, yield));
-
-	auto track = queue_it->second->add_track(
-		{{},
+	auto track = state->queue->add_track(
+		{0,
 		 requester_id,
 		 std::move(meta.webpage_url),
 		 std::move(meta.title),
 		 {}});
 
-	log<ekizu::LogLevel::Info>(
-		"Enqueued track {} (Title: {})", track.id, track.title);
+	log<ekizu::LogLevel::Info>("Enqueued track {} ({})", track.id, track.title);
 
-	auto &st = m_playback[guild_id];
-
-	if (!st.running) {
-		st.running = true;
-
+	if (!state->playback.running) {
+		state->playback.running = true;
 		asio::spawn(
 			yield,
 			[this, guild_id](const auto &y) {
-				auto res = playback_loop(guild_id, y);
+				auto res = m_playback_ctrl.start_loop(guild_id, y);
 				if (res.has_error() &&
 					res.error() != boost::system::errc::operation_canceled) {
 					log<ekizu::LogLevel::Error>(
-						"Playback loop failed for guild {}: {}", guild_id,
-						res.error().message());
+						"Playback loop failed: {}", res.error().message());
 				}
 			},
 			asio::detached);
 	}
 
-	mark_persist_dirty(guild_id);
+	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return track;
 }
 
-Result<> Player::playback_loop(ekizu::Snowflake guild_id,
-							   const asio::yield_context &yield) {
-	auto conn_it = m_connections.find(guild_id);
-	auto queue_it = m_queues.find(guild_id);
-	if (conn_it == m_connections.end() || queue_it == m_queues.end()) {
+Result<bool> Player::skip(ekizu::Snowflake guild_id) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->queue ||
+		!state->queue->current_track_id) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
-	auto *conn = conn_it->second.get();
-	auto *q = queue_it->second.get();
-	if ((conn == nullptr) || (q == nullptr)) {
+	auto it = std::find_if(
+		state->queue->tracks.begin(), state->queue->tracks.end(),
+		[id = *state->queue->current_track_id](const Track &t) {
+			return t.id == id;
+		});
+
+	if (it == state->queue->tracks.end()) { return false; }
+
+	auto next = std::next(it);
+	if (next == state->queue->tracks.end()) { return false; }
+
+	state->queue->current_track_id = next->id;
+	m_playback_ctrl.mark_persist_dirty(guild_id);
+	state->cancel_stream();
+	return true;
+}
+
+Result<bool> Player::previous(ekizu::Snowflake guild_id) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->queue ||
+		!state->queue->current_track_id) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	PlaybackState &st = st_it->second;
+	const auto elapsed = state->elapsed();
 
-	while (true) {
-		if (conn->is_shutdown()) { break; }
-		if (!q->current_track_id) { break; }
+	if (elapsed < PlaybackController::k_previous_restart_threshold) {
+		auto it = std::find_if(
+			state->queue->tracks.begin(), state->queue->tracks.end(),
+			[id = *state->queue->current_track_id](const Track &t) {
+				return t.id == id;
+			});
 
-		auto cur_it = std::find_if(
-			q->tracks.begin(), q->tracks.end(),
-			[&](const Track &t) { return t.id == *q->current_track_id; });
-
-		if (cur_it == q->tracks.end()) {
-			q->current_track_id.reset();
-			mark_persist_dirty(guild_id);
-			break;
+		if (it != state->queue->tracks.end() &&
+			it != state->queue->tracks.begin()) {
+			state->queue->current_track_id = std::prev(it)->id;
 		}
-
-		const uint64_t cur_track_id = cur_it->id;
-		const ekizu::Snowflake cur_requester_id = cur_it->requester_id;
-		const std::string cur_title = cur_it->title;
-
-		const auto now = std::chrono::steady_clock::now();
-		st.track_started = now;
-		st.paused_total = std::chrono::steady_clock::duration::zero();
-		if (st.paused) {
-			st.pause_started = now;
-		} else {
-			st.pause_started.reset();
-		}
-
-		st.frames_sent = 0;
-		st.limiter_gain = 1.0F;
-
-		log<ekizu::LogLevel::Info>(
-			"Starting track {} (Title: {})", cur_track_id, cur_title);
-
-		if (st.paused) {
-			boost::system::error_code ignored;
-			(void)conn->send_track_data(
-				{{}, false, cur_requester_id, cur_track_id}, yield[ignored]);
-			(void)conn->pause();
-		}
-
-		auto res = play_sync(guild_id, *cur_it, yield);
-
-		if (conn->is_shutdown()) { break; }
-
-		if (res.has_error()) {
-			if (res.error() == boost::system::errc::operation_canceled) {
-				continue;
-			}
-
-			log<ekizu::LogLevel::Error>("Playback failed for track {}: {}",
-										cur_track_id, res.error().message());
-
-			if (q->current_track_id && (*q->current_track_id == cur_track_id)) {
-				auto it = std::find_if(
-					q->tracks.begin(), q->tracks.end(),
-					[&](const Track &t) { return t.id == cur_track_id; });
-
-				if (it != q->tracks.end()) {
-					auto next = std::next(it);
-					if (next != q->tracks.end()) {
-						q->current_track_id = next->id;
-						mark_persist_dirty(guild_id);
-						continue;
-					}
-				}
-
-				q->current_track_id.reset();
-				mark_persist_dirty(guild_id);
-				break;
-			}
-
-			continue;
-		}
-
-		if (!q->current_track_id || (*q->current_track_id != cur_track_id)) {
-			continue;
-		}
-
-		auto it =
-			std::find_if(q->tracks.begin(), q->tracks.end(),
-						 [&](const Track &t) { return t.id == cur_track_id; });
-
-		if (it != q->tracks.end()) {
-			auto next = std::next(it);
-			if (next != q->tracks.end()) {
-				q->current_track_id = next->id;
-				mark_persist_dirty(guild_id);
-				continue;
-			}
-		}
-
-		q->current_track_id.reset();
-		mark_persist_dirty(guild_id);
-		break;
 	}
 
-	{
-		boost::system::error_code ignored;
-		(void)conn->stop_speaking(yield[ignored]);
-	}
-
-	st.active_stream.reset();
-	st.running = false;
-	st.paused = false;
-	st.pause_started.reset();
-	st.paused_total = std::chrono::steady_clock::duration::zero();
-
-	log<ekizu::LogLevel::Info>("Playback loop exited for guild {}", guild_id);
-	mark_persist_dirty(guild_id);
-	return outcome::success();
+	state->cancel_stream();
+	return true;
 }
 
 Result<> Player::pause(ekizu::Snowflake guild_id) {
-	auto it = m_connections.find(guild_id);
-	if (it == m_connections.end()) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->connection) {
 		return boost::system::errc::no_such_file_or_directory;
 	}
 
-	auto st_it = m_playback.find(guild_id);
-	if (st_it != m_playback.end()) {
-		auto &st = st_it->second;
-		if (st.running && !st.paused) {
-			st.paused = true;
-			st.pause_started = std::chrono::steady_clock::now();
-		}
+	if (state->playback.running && !state->playback.paused) {
+		state->playback.paused = true;
+		state->playback.pause_started = std::chrono::steady_clock::now();
 	}
 
-	auto res = it->second->pause();
-	mark_persist_dirty(guild_id);
-	return res;
+	m_playback_ctrl.mark_persist_dirty(guild_id);
+	return state->connection->pause();
 }
 
 Result<> Player::resume(ekizu::Snowflake guild_id) {
-	auto it = m_connections.find(guild_id);
-	if (it == m_connections.end()) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->connection) {
 		return boost::system::errc::no_such_file_or_directory;
 	}
 
-	auto st_it = m_playback.find(guild_id);
-	if (st_it != m_playback.end()) {
-		auto &st = st_it->second;
-		if (st.running && st.paused) {
-			if (st.pause_started) {
-				st.paused_total +=
-					(std::chrono::steady_clock::now() - *st.pause_started);
-			}
-			st.pause_started.reset();
-			st.paused = false;
+	if (state->playback.running && state->playback.paused) {
+		if (state->playback.pause_started) {
+			state->playback.paused_total += std::chrono::steady_clock::now() -
+											*state->playback.pause_started;
 		}
+		state->playback.pause_started.reset();
+		state->playback.paused = false;
 	}
 
-	auto res = it->second->resume();
-	mark_persist_dirty(guild_id);
-	return res;
+	m_playback_ctrl.mark_persist_dirty(guild_id);
+	return state->connection->resume();
 }
 
-void Player::shutdown() {
-	log<ekizu::LogLevel::Info>("Player shutting down...");
-
-	for (auto &[guild_id, st] : m_playback) {
-		if (st.active_stream) { st.active_stream->cancel(); }
+// Audio settings getters/setters
+#define AUDIO_SETTING_IMPL(name, type)                                   \
+	Result<type> Player::name(ekizu::Snowflake guild_id) const {         \
+		auto *state = m_state_mgr.get(guild_id);                         \
+		if (!state) return boost::system::errc::operation_not_permitted; \
+		return state->audio.name;                                        \
+	}                                                                    \
+	Result<> Player::set_##name(ekizu::Snowflake guild_id, type value) { \
+		auto *state = m_state_mgr.get(guild_id);                         \
+		if (!state) return boost::system::errc::operation_not_permitted; \
+		state->audio.name = value;                                       \
+		state->audio.clamp();                                            \
+		m_playback_ctrl.mark_persist_dirty(guild_id);                    \
+		return outcome::success();                                       \
 	}
 
-	for (auto &[guild_id, conn] : m_connections) {
-		if (conn) {
-			log<ekizu::LogLevel::Debug>(
-				"Shutting down connection for guild {}", guild_id);
-			conn->shutdown();
+AUDIO_SETTING_IMPL(volume, float)
+AUDIO_SETTING_IMPL(fade_ms, int)
+AUDIO_SETTING_IMPL(limiter_enabled, bool)
+AUDIO_SETTING_IMPL(limiter_threshold_db, float)
+AUDIO_SETTING_IMPL(limiter_release_ms, int)
+
+Result<> Player::restore_all(const asio::yield_context &yield) {
+	SABER_TRY(auto states, m_persist_mgr.restore_all(yield));
+
+	for (auto &data : states) {
+		auto *state = m_state_mgr.get_or_create(data.guild_id);
+
+		state->last_voice_channel = data.voice_channel_id;
+		state->audio = data.audio;
+		state->playback.paused = data.paused;
+
+		if (!state->queue) {
+			state->queue = std::make_unique<GuildQueue>([this](ekizu::Log l) {
+				if (m_logger) { m_logger(std::move(l)); }
+			});
 		}
-	}
 
-	m_connections.clear();
-	m_queues.clear();
-	m_persist_disabled.store(true, std::memory_order_release);
-	{
-		std::lock_guard<std::mutex> lock(m_persist_mutex);
-		m_persist_entries.clear();
-	}
-	m_persist_pool.stop();
-	m_persist_pool.join();
+		state->queue->current_track_id = data.queue.current_track_id;
+		state->queue->last_track_id = data.queue.last_track_id;
+		state->queue->tracks = std::move(data.queue.tracks);
 
-	m_playback.clear();
-
-	log<ekizu::LogLevel::Info>("Player shutdown complete");
-}
-
-Result<std::string> Player::resolve_url(ekizu::Snowflake guild_id,
-										std::string_view query,
-										const asio::yield_context &yield) {
-	boost::system::error_code ec;
-
-	auto exe = bp::environment::find_executable("yt-dlp");
-	if (exe.empty()) {
-		log<ekizu::LogLevel::Error>("yt-dlp executable not found");
-		return boost::system::errc::no_such_file_or_directory;
-	}
-
-	const auto search_arg = make_search_arg(query);
-
-	std::vector<std::string> args{
-		"--no-playlist", "--quiet", "--no-warnings", "--encoding", "utf-8",
-		"--get-url",	 "-f",		"bestaudio",	 search_arg};
-
-	auto resources =
-		std::make_shared<StreamResources>(yield.get_executor(), exe, args);
-
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	st_it->second.active_stream = resources;
-
-	BOOST_SCOPE_EXIT_ALL(&st_it, &resources) {
-		if (st_it->second.active_stream == resources) {
-			st_it->second.active_stream.reset();
+		if (state->last_voice_channel) {
+			(void)connect(data.guild_id, *state->last_voice_channel, yield);
 		}
-	};
 
-	asio::spawn(
-		yield.get_executor(),
-		[resources](const auto &y) mutable {
-			auto buf = std::make_shared<std::array<char, 4096>>();
-			boost::system::error_code ignore;
-			while (true) {
-				size_t n = resources->ep.async_read_some(
-					asio::buffer(*buf), y[ignore]);
-				if (ignore || n == 0) { break; }
+		if (state->connection && state->queue->current_track_id) {
+			if (!state->playback.running) {
+				state->playback.running = true;
+				asio::spawn(
+					yield,
+					[this, guild_id = data.guild_id](const auto &y) {
+						(void)m_playback_ctrl.start_loop(guild_id, y);
+					},
+					asio::detached);
 			}
-		},
-		asio::detached);
-
-	std::string url;
-	url.reserve(512);
-	std::array<char, 4096> chunk{};
-
-	while (true) {
-		auto n = resources->rp.async_read_some(asio::buffer(chunk), yield[ec]);
-		if (n > 0) { url.append(chunk.data(), n); }
-		if (ec) { break; }
-	}
-
-	if (ec == asio::error::operation_aborted ||
-		ec == asio::error::bad_descriptor || !resources->rp.is_open()) {
-		return boost::system::errc::operation_canceled;
-	}
-	if (ec && ec != asio::error::eof && ec != asio::error::broken_pipe) {
-		return ec;
-	}
-
-	int exit_code = resources->proc.async_wait(yield[ec]);
-	if (ec == asio::error::operation_aborted ||
-		ec == asio::error::bad_descriptor) {
-		return boost::system::errc::operation_canceled;
-	}
-	if (ec) { return ec; }
-
-	url = trim_copy(std::move(url));
-
-	if (exit_code != 0 || url.empty()) {
-		return boost::system::errc::no_message_available;
-	}
-
-	return url;
-}
-
-Result<> Player::play_sync(ekizu::Snowflake guild_id, Track &track,
-						   const asio::yield_context &yield) {
-	if (track.webpage_url.empty()) {
-		return boost::system::errc::invalid_argument;
-	}
-
-	SABER_TRY(auto url, resolve_url(guild_id, track.webpage_url, yield));
-	track.stream_url = url;
-
-	log<ekizu::LogLevel::Info>(
-		"Resolved stream URL for track {}: {}", track.id, track.stream_url);
-
-	auto conn_it = m_connections.find(guild_id);
-	if (conn_it == m_connections.end()) {
-		return boost::system::errc::no_such_file_or_directory;
-	}
-
-	PlayerConnection *conn = conn_it->second.get();
-
-	if (conn->is_shutdown()) { return boost::system::errc::operation_canceled; }
-
-	auto res = stream_ffmpeg(
-		guild_id, conn, track.stream_url, track.requester_id, track.id, yield);
-
-	if (!conn->is_shutdown()) {
-		boost::system::error_code ignore;
-		(void)conn->send_track_data(
-			{{}, true, track.requester_id, track.id}, yield[ignore]);
-	}
-
-	return res;
-}
-
-Result<> Player::stream_ffmpeg(ekizu::Snowflake guild_id,
-							   PlayerConnection *conn, std::string_view url,
-							   ekizu::Snowflake requester_id, uint64_t track_id,
-							   const asio::yield_context &yield) {
-	auto ffmpeg_exe = bp::environment::find_executable("ffmpeg");
-	if (ffmpeg_exe.empty()) {
-		return boost::system::errc::no_such_file_or_directory;
-	}
-
-	std::vector<std::string> args{
-		"-reconnect",
-		"1",
-		"-reconnect_streamed",
-		"1",
-		"-reconnect_at_eof",
-		"1",
-		"-reconnect_delay_max",
-		"5",
-		"-user_agent",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
-		"like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"-loglevel",
-		"warning",
-		"-i",
-		std::string{url},
-		"-map",
-		"0:a",
-		"-ac",
-		"2",
-		"-ar",
-		"48000",
-		"-f",
-		"s16le",
-		"-"};
-
-	auto resources = std::make_shared<StreamResources>(
-		yield.get_executor(), ffmpeg_exe, args);
-
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-
-	st_it->second.active_stream = resources;
-
-	asio::spawn(
-		yield.get_executor(),
-		[resources](const auto &y) mutable {
-			auto buf = std::make_shared<std::array<char, 4096>>();
-			boost::system::error_code ignore;
-			while (true) {
-				size_t n = resources->ep.async_read_some(
-					asio::buffer(*buf), y[ignore]);
-				if (ignore || n == 0) { break; }
-			}
-		},
-		asio::detached);
-
-	BOOST_SCOPE_EXIT_ALL(&resources, &st_it) {
-		boost::system::error_code ignore;
-		resources->proc.request_exit(ignore);
-		st_it->second.active_stream.reset();
-	};
-
-	log<ekizu::LogLevel::Info>("Starting ffmpeg stream for track {}", track_id);
-	return process_pcm_stream(
-		conn, resources->rp, requester_id, track_id, guild_id, yield);
-}
-
-Result<> Player::process_pcm_stream(
-	PlayerConnection *conn, asio::readable_pipe &rp,
-	ekizu::Snowflake requester_id, uint64_t track_id, ekizu::Snowflake guild_id,
-	const asio::yield_context &yield) {
-	static constexpr int k_sample_rate = 48000;
-	static constexpr int k_channels = 2;
-	static constexpr int k_frame_ms = 20;
-	static constexpr int k_frame_samples = 960;
-	static constexpr auto k_frame_bytes =
-		static_cast<size_t>(k_frame_samples * k_channels * sizeof(int16_t));
-	static constexpr auto k_pcm_samples =
-		static_cast<size_t>(k_frame_samples * k_channels);
-	static constexpr size_t k_settings_refresh_interval = 50;
-
-	using Frame = std::array<opus_int16, k_frame_samples * k_channels>;
-
-	int opus_err = 0;
-	OpusEncoder *encoder = opus_encoder_create(
-		k_sample_rate, k_channels, OPUS_APPLICATION_AUDIO, &opus_err);
-	if (opus_err != OPUS_OK || encoder == nullptr) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	BOOST_SCOPE_EXIT_ALL(&encoder) { opus_encoder_destroy(encoder); };
-
-	(void)opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
-
-	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end()) {
-		return boost::system::errc::operation_not_permitted;
-	}
-	PlaybackState &state = st_it->second;
-
-	int fade_ms_cfg = state.fade_ms.load(std::memory_order_acquire);
-	fade_ms_cfg = clamp_fade_ms(fade_ms_cfg);
-	const size_t fade_frames =
-		(fade_ms_cfg <= 0)
-			? 0U
-			: static_cast<size_t>((fade_ms_cfg + k_frame_ms - 1) / k_frame_ms);
-
-	std::deque<Frame> delay;
-
-	RingBuffer pending(65536);
-
-	auto read_buffer = std::make_shared<std::vector<uint8_t>>(8192);
-	std::array<uint8_t, 4096> opus_buf{};
-	Frame pcm_frame{};
-
-	struct CachedSettings {
-		float volume{1.0F};
-		bool limiter_enabled{true};
-		float limiter_threshold_db{-1.0F};
-		int limiter_release_ms{120};
-		size_t frames_until_refresh{0};
-
-		void refresh(PlaybackState &st) {
-			volume = st.volume.load(std::memory_order_acquire);
-			limiter_enabled =
-				st.limiter_enabled.load(std::memory_order_acquire);
-			limiter_threshold_db =
-				st.limiter_threshold_db.load(std::memory_order_acquire);
-			limiter_release_ms =
-				st.limiter_release_ms.load(std::memory_order_acquire);
-
-			limiter_threshold_db =
-				clamp_limiter_threshold_db(limiter_threshold_db);
-			limiter_release_ms = clamp_limiter_release_ms(limiter_release_ms);
-
-			frames_until_refresh = k_settings_refresh_interval;
-		}
-	};
-
-	CachedSettings settings;
-	settings.refresh(state);
-
-	boost::system::error_code ec;
-	size_t frames_since_shutdown_check = 0;
-
-	auto send_frame_inline = [&](float extra_gain) -> Result<> {
-		if (--settings.frames_until_refresh == 0) { settings.refresh(state); }
-
-		float fade_in = 1.0F;
-		if (fade_frames > 0 && state.frames_sent < fade_frames) {
-			fade_in = static_cast<float>(state.frames_sent + 1) /
-					  static_cast<float>(fade_frames);
-			fade_in = std::min(fade_in, 1.0F);
-		}
-
-		const float total_gain = settings.volume * fade_in * extra_gain;
-
-#ifdef __x86_64__
-		audio::apply_gain_i16_simd(
-			reinterpret_cast<int16_t *>(pcm_frame.data()), k_pcm_samples,
-			total_gain);
-#else
-		audio::apply_gain_i16(reinterpret_cast<int16_t *>(pcm_frame.data()),
-							  k_pcm_samples, total_gain);
-#endif
-
-		audio::LimiterState lst{state.limiter_gain};
-		audio::apply_peak_limiter_i16(
-			reinterpret_cast<int16_t *>(pcm_frame.data()), k_pcm_samples, lst,
-			settings.limiter_enabled, settings.limiter_threshold_db, k_frame_ms,
-			settings.limiter_release_ms);
-		state.limiter_gain = lst.gain;
-
-		int encoded = opus_encode(
-			encoder, pcm_frame.data(), k_frame_samples, opus_buf.data(),
-			static_cast<opus_int32>(opus_buf.size()));
-
-		if (encoded < 0) {
-			log<ekizu::LogLevel::Error>(
-				"Opus encode failed for track {}: {}", track_id, encoded);
-			return boost::system::errc::operation_not_permitted;
-		}
-
-		TrackData td;
-		td.data.assign(
-			reinterpret_cast<std::byte *>(opus_buf.data()),
-			reinterpret_cast<std::byte *>(opus_buf.data() + encoded));
-		td.finished = false;
-		td.requester_id = requester_id;
-		td.track_id = track_id;
-
-		auto res = conn->send_track_data(std::move(td), yield);
-		if (res.has_error()) {
-			if (res.error() == boost::system::errc::operation_canceled) {
-				log<ekizu::LogLevel::Info>(
-					"Track {} canceled during playback", track_id);
-			} else {
-				log<ekizu::LogLevel::Error>(
-					"Failed to send track data for {}: {}", track_id,
-					res.error().message());
-			}
-			return res;
-		}
-
-		++state.frames_sent;
-		return outcome::success();
-	};
-
-	while (true) {
-		if (++frames_since_shutdown_check >= 10) {
-			frames_since_shutdown_check = 0;
-			if (conn->is_shutdown()) {
-				log<ekizu::LogLevel::Info>(
-					"Connection shutdown detected, stopping track {}",
-					track_id);
-				return boost::system::errc::operation_canceled;
-			}
-		}
-
-		read_buffer->resize(8192);
-		size_t bytes_read =
-			rp.async_read_some(asio::buffer(*read_buffer), yield[ec]);
-
-		if (ec == asio::error::operation_aborted ||
-			ec == asio::error::bad_descriptor || !rp.is_open()) {
-			log<ekizu::LogLevel::Info>(
-				"Stream read cancelled for track {}", track_id);
-			return boost::system::errc::operation_canceled;
-		}
-
-		if (ec) {
-			if (ec != asio::error::eof && ec != asio::error::broken_pipe) {
-				log<ekizu::LogLevel::Error>(
-					"Stream read error for track {}: {}", track_id,
-					ec.message());
-			}
-			break;
-		}
-
-		if (bytes_read == 0) { break; }
-
-		pending.write(read_buffer->data(), bytes_read);
-
-		while (pending.size() >= k_frame_bytes) {
-			pending.read(
-				reinterpret_cast<uint8_t *>(pcm_frame.data()), k_frame_bytes);
-
-			if (fade_frames > 0) {
-				delay.push_back(pcm_frame);
-				if (delay.size() <= fade_frames) { continue; }
-				pcm_frame = delay.front();
-				delay.pop_front();
-				SABER_TRY(send_frame_inline(1.0F));
-			} else {
-				SABER_TRY(send_frame_inline(1.0F));
-			}
-		}
-	}
-
-	if (fade_frames > 0 && !delay.empty()) {
-		const size_t remaining = delay.size();
-		const float fade_step =
-			(remaining > 1) ? 1.0F / static_cast<float>(remaining - 1) : 0.0F;
-
-		for (size_t i = 0; i < remaining; ++i) {
-			pcm_frame = delay.front();
-			delay.pop_front();
-
-			const float fade_out =
-				(remaining > 1)
-					? std::clamp(
-						  static_cast<float>(remaining - i - 1) * fade_step,
-						  0.0F, 1.0F)
-					: 0.0F;
-
-			auto r = send_frame_inline(fade_out);
-			if (r.has_error()) { return r; }
 		}
 	}
 
 	return outcome::success();
+}
+
+void Player::shutdown() {
+	log<ekizu::LogLevel::Info>("Shutting down player...");
+
+	for (auto guild_id : m_state_mgr.all_guilds()) {
+		if (auto *state = m_state_mgr.get(guild_id)) {
+			state->cancel_stream();
+			if (state->connection) { state->connection->shutdown(); }
+		}
+	}
+
+	m_state_mgr.clear();
+	m_persist_mgr.disable();
+
+	log<ekizu::LogLevel::Info>("Player shutdown complete");
 }
 
 }  // namespace saber

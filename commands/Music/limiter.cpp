@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cmath>
 #include <saber/util.hpp>
 #include <string>
 
@@ -125,8 +124,8 @@ struct Limiter : Command {
 				return outcome::success();
 			}
 
-			ms = std::max(ms, 0);
-			ms = std::min(ms, 2000);
+			ms = std::clamp(ms, AudioSettings::k_limiter_release_min,
+							AudioSettings::k_limiter_release_max);
 
 			SABER_TRY(
 				bot.player().set_limiter_release_ms(*message.guild_id, ms));

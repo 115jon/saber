@@ -3,6 +3,7 @@
 
 #include <random>
 #include <saber/saber.hpp>
+#include <saber/track.hpp>
 
 namespace saber::util {
 template <typename T>

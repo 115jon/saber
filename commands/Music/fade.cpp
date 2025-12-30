@@ -4,6 +4,9 @@
 
 using namespace saber;
 
+const std::string k_usage_str = fmt::format(
+	"fade [{}-{}]", AudioSettings::k_fade_min, AudioSettings::k_fade_max);
+
 struct Fade : Command {
 	explicit Fade(Saber &creator)
 		: Command(
@@ -13,7 +16,7 @@ struct Fade : Command {
 				  .category(DIRNAME)
 				  .enabled(true)
 				  .guild_only(true)
-				  .usage("fade [0-2000]")
+				  .usage(k_usage_str)
 				  .description(
 					  "Shows or sets the track fade duration in milliseconds.")
 				  .bot_permissions(ekizu::Permissions::SendMessages |
@@ -68,14 +71,15 @@ struct Fade : Command {
 		} catch (...) {
 			SABER_TRY(bot.http()
 						  .create_message(message.channel_id)
-						  .content("Invalid fade. Usage: `fade [0-2000]`.")
+						  .content(fmt::format(
+							  "Invalid fade. Usage: `{}`.", k_usage_str))
 						  .reply(message.id)
 						  .send(yield));
 			return outcome::success();
 		}
 
-		ms = std::max(ms, 0);
-		ms = std::min(ms, 2000);
+		ms = std::clamp(
+			ms, AudioSettings::k_fade_min, AudioSettings::k_fade_max);
 
 		SABER_TRY(bot.player().set_fade_ms(*message.guild_id, ms));
 
