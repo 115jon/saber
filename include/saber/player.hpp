@@ -29,6 +29,10 @@ struct Player {
 
 	SABER_EXPORT Result<bool> skip(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<bool> previous(ekizu::Snowflake guild_id);
+	SABER_EXPORT Result<bool> skip_to(ekizu::Snowflake guild_id,
+									  uint64_t track_id);
+	SABER_EXPORT Result<bool> shuffle(ekizu::Snowflake guild_id);
+	SABER_EXPORT Result<bool> clear(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<> pause(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<> resume(ekizu::Snowflake guild_id);
 
@@ -76,6 +80,42 @@ struct Player {
 	PersistenceManager m_persist_mgr{1};
 	PlaybackController m_playback_ctrl{
 		m_stream_mgr, m_audio_proc, m_state_mgr, m_persist_mgr};
+
+	void ensure_playback(ekizu::Snowflake guild_id, GuildState *state,
+						 const asio::yield_context &yield) {
+		if (state->playback.running) { return; }
+
+		state->playback.running = true;
+		asio::spawn(
+			yield,
+			[this, guild_id](const auto &y) {
+				auto res = m_playback_ctrl.start_loop(guild_id, y);
+				if (res.has_error() &&
+					res.error() != boost::system::errc::operation_canceled) {
+					log<ekizu::LogLevel::Error>(
+						"Playback loop failed: {}", res.error().message());
+				}
+			},
+			asio::detached);
+	}
+
+	Result<GuildState *> get_state(ekizu::Snowflake guild_id) {
+		auto *state = m_state_mgr.get(guild_id);
+		if ((state == nullptr) || !state->queue) {
+			return boost::system::errc::operation_not_permitted;
+		}
+		return state;
+	}
+
+	template <typename Func>
+	Result<bool> modify_state(ekizu::Snowflake guild_id, Func action) {
+		SABER_TRY(auto *state, get_state(guild_id));
+		if (action(state, state->queue.get())) {
+			m_playback_ctrl.mark_persist_dirty(guild_id);
+			return true;
+		}
+		return false;
+	}
 
 	template <ekizu::LogLevel Level, typename... Args>
 	void log(fmt::format_string<Args...> fmt, Args &&...args) const {

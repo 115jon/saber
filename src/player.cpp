@@ -1,7 +1,14 @@
+#include <algorithm>
 #include <boost/asio/spawn.hpp>
+#include <random>
 #include <saber/player.hpp>
 
 namespace saber {
+
+static std::mt19937 &rng() {
+	static thread_local std::mt19937 rng{std::random_device{}()};
+	return rng;
+}
 
 Player::Player(Connector connector) : m_connector(std::move(connector)) {}
 
@@ -23,10 +30,7 @@ Result<ekizu::Snowflake> Player::voice_channel_id(
 }
 
 Result<GuildQueue *> Player::queue(ekizu::Snowflake guild_id) {
-	auto *state = m_state_mgr.get(guild_id);
-	if ((state == nullptr) || !state->queue) {
-		return boost::system::errc::operation_not_permitted;
-	}
+	SABER_TRY(auto *state, get_state(guild_id));
 	return state->queue.get();
 }
 
@@ -41,16 +45,14 @@ Result<bool> Player::connect(ekizu::Snowflake guild_id,
 	log<ekizu::LogLevel::Info>("Connecting to guild {}", guild_id);
 	SABER_TRY(auto config, m_connector(guild_id, channel_id, yield));
 
-	if (!state->queue) {
-		state->queue = std::make_unique<GuildQueue>([this](ekizu::Log l) {
-			if (m_logger) { m_logger(std::move(l)); }
-		});
-	}
+	auto log_cb = [this](ekizu::Log l) {
+		if (m_logger) { m_logger(std::move(l)); }
+	};
 
-	state->connection = std::make_unique<PlayerConnection>(
-		*config, state->queue.get(), [this](ekizu::Log l) {
-			if (m_logger) { m_logger(std::move(l)); }
-		});
+	if (!state->queue) { state->queue = std::make_unique<GuildQueue>(log_cb); }
+
+	state->connection =
+		std::make_unique<PlayerConnection>(*config, state->queue.get(), log_cb);
 
 	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return true;
@@ -75,73 +77,103 @@ Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 
 	log<ekizu::LogLevel::Info>("Enqueued track {} ({})", track.id, track.title);
 
-	if (!state->playback.running) {
-		state->playback.running = true;
-		asio::spawn(
-			yield,
-			[this, guild_id](const auto &y) {
-				auto res = m_playback_ctrl.start_loop(guild_id, y);
-				if (res.has_error() &&
-					res.error() != boost::system::errc::operation_canceled) {
-					log<ekizu::LogLevel::Error>(
-						"Playback loop failed: {}", res.error().message());
-				}
-			},
-			asio::detached);
-	}
-
+	ensure_playback(guild_id, state, yield);
 	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return track;
 }
 
 Result<bool> Player::skip(ekizu::Snowflake guild_id) {
-	auto *state = m_state_mgr.get(guild_id);
-	if ((state == nullptr) || !state->queue ||
-		!state->queue->current_track_id) {
-		return boost::system::errc::operation_not_permitted;
-	}
+	return modify_state(guild_id, [](GuildState *state, GuildQueue *q) {
+		if (!q->current_track_id) { return false; }
 
-	auto it = std::find_if(
-		state->queue->tracks.begin(), state->queue->tracks.end(),
-		[id = *state->queue->current_track_id](const Track &t) {
-			return t.id == id;
-		});
+		auto &tracks = q->tracks;
+		auto it = std::find_if(
+			tracks.begin(), tracks.end(),
+			[id = *q->current_track_id](const auto &t) { return t.id == id; });
 
-	if (it == state->queue->tracks.end()) { return false; }
+		if (it == tracks.end()) { return false; }
+		auto next = std::next(it);
+		if (next == tracks.end()) { return false; }
 
-	auto next = std::next(it);
-	if (next == state->queue->tracks.end()) { return false; }
-
-	state->queue->current_track_id = next->id;
-	m_playback_ctrl.mark_persist_dirty(guild_id);
-	state->cancel_stream();
-	return true;
+		q->current_track_id = next->id;
+		state->cancel_stream();
+		return true;
+	});
 }
 
 Result<bool> Player::previous(ekizu::Snowflake guild_id) {
-	auto *state = m_state_mgr.get(guild_id);
-	if ((state == nullptr) || !state->queue ||
-		!state->queue->current_track_id) {
-		return boost::system::errc::operation_not_permitted;
-	}
+	return modify_state(guild_id, [](GuildState *state, GuildQueue *q) {
+		if (!q->current_track_id) { return false; }
 
-	const auto elapsed = state->elapsed();
+		if (state->elapsed() <
+			PlaybackController::k_previous_restart_threshold) {
+			auto &tracks = q->tracks;
+			auto it = std::find_if(tracks.begin(), tracks.end(),
+								   [id = *q->current_track_id](const auto &t) {
+									   return t.id == id;
+								   });
 
-	if (elapsed < PlaybackController::k_previous_restart_threshold) {
-		auto it = std::find_if(
-			state->queue->tracks.begin(), state->queue->tracks.end(),
-			[id = *state->queue->current_track_id](const Track &t) {
-				return t.id == id;
-			});
-
-		if (it != state->queue->tracks.end() &&
-			it != state->queue->tracks.begin()) {
-			state->queue->current_track_id = std::prev(it)->id;
+			if (it != tracks.end() && it != tracks.begin()) {
+				q->current_track_id = std::prev(it)->id;
+			}
 		}
-	}
+		state->cancel_stream();
+		return true;
+	});
+}
 
-	state->cancel_stream();
-	return true;
+Result<bool> Player::skip_to(ekizu::Snowflake guild_id, uint64_t track_id) {
+	return modify_state(guild_id, [track_id](GuildState *state, GuildQueue *q) {
+		if (!q->current_track_id) { return false; }
+		if (*q->current_track_id == track_id) { return false; }
+		if (!q->skip(track_id)) { return false; }
+
+		state->cancel_stream();
+		return true;
+	});
+}
+
+Result<bool> Player::shuffle(ekizu::Snowflake guild_id) {
+	return modify_state(guild_id, [](GuildState *, GuildQueue *q) {
+		auto &tracks = q->tracks;
+		if (tracks.size() < 2) { return false; }
+
+		auto start_it = tracks.begin();
+		if (q->current_track_id) {
+			auto it = std::find_if(tracks.begin(), tracks.end(),
+								   [id = *q->current_track_id](const auto &t) {
+									   return t.id == id;
+								   });
+			if (it == tracks.end()) { return false; }
+			start_it = std::next(it);
+		}
+
+		if (std::distance(start_it, tracks.end()) < 2) { return false; }
+
+		std::shuffle(start_it, tracks.end(), rng());
+		return true;
+	});
+}
+
+Result<bool> Player::clear(ekizu::Snowflake guild_id) {
+	return modify_state(guild_id, [](GuildState *, GuildQueue *q) {
+		auto &tracks = q->tracks;
+		if (tracks.empty()) { return false; }
+
+		auto start_it = tracks.begin();
+		if (q->current_track_id) {
+			auto it = std::find_if(tracks.begin(), tracks.end(),
+								   [id = *q->current_track_id](const auto &t) {
+									   return t.id == id;
+								   });
+			if (it == tracks.end()) { return false; }
+			start_it = std::next(it);
+		}
+
+		if (start_it == tracks.end()) { return false; }
+		tracks.erase(start_it, tracks.end());
+		return true;
+	});
 }
 
 Result<> Player::pause(ekizu::Snowflake guild_id) {
@@ -225,15 +257,7 @@ Result<> Player::restore_all(const asio::yield_context &yield) {
 		}
 
 		if (state->connection && state->queue->current_track_id) {
-			if (!state->playback.running) {
-				state->playback.running = true;
-				asio::spawn(
-					yield,
-					[this, guild_id = data.guild_id](const auto &y) {
-						(void)m_playback_ctrl.start_loop(guild_id, y);
-					},
-					asio::detached);
-			}
+			ensure_playback(data.guild_id, state, yield);
 		}
 	}
 

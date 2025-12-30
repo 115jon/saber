@@ -117,11 +117,30 @@ Result<boost::optional<ekizu::VoiceState &>> in_voice_channel(
 
 	if (!voice_state.map([](auto &state) { return !!state.channel_id; })
 			 .value_or(false)) {
-		SABER_TRY(bot.http()
-					  .create_message(msg.channel_id)
-					  .content("You are not in a voice channel!")
-					  .reply(msg.id)
-					  .send(yield));
+		SABER_TRY(
+			bot.http()
+				.create_message(msg.channel_id)
+				.components(
+					{ekizu::ContainerBuilder()
+						 .accent_color(0xff0000)
+						 .add(
+							 ekizu::TextDisplayBuilder()
+								 .content(
+									 "You have to be connected in a voice "
+									 "channel "
+									 "before you can use this command!\n> [How "
+									 "to "
+									 "join a voice "
+									 "channel?](https://support.discord.com/hc/"
+									 "en-us/articles/"
+									 "360045138571-Beginner-s-Guide-to-Discord#"
+									 "h_"
+									 "9de92bc2-3bca-459f-8efd-e1e2739ca4f4)")
+								 .build())
+						 .build()})
+				.reply(msg.id)
+				.flags(ekizu::MessageFlags::IsComponentsV2)
+				.send(yield));
 		return outcome::failure(boost::system::error_code{});
 	}
 
