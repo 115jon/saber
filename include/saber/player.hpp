@@ -93,23 +93,66 @@ struct Player {
 	struct StreamResources;
 
 	struct PlaybackState {
-		bool running{};
-		bool paused{};
-		std::chrono::steady_clock::time_point track_started;
-		std::chrono::steady_clock::duration paused_total{};
+		std::atomic<float> volume{1.0F};
+		std::atomic<int> fade_ms{120};
+		std::atomic<bool> limiter_enabled{true};
+		std::atomic<float> limiter_threshold_db{-1.0F};
+		std::atomic<int> limiter_release_ms{120};
+
+		bool running{false};
+		bool paused{false};
 		std::optional<std::chrono::steady_clock::time_point> pause_started;
+		std::chrono::steady_clock::duration paused_total{};
+		std::chrono::steady_clock::time_point track_started;
+
+		size_t frames_sent{0};
+		float limiter_gain{1.0F};
+
 		std::shared_ptr<StreamResources> active_stream;
 
-		// Shared so unordered_map rehash/move cannot invalidate atomics.
-		std::shared_ptr<std::atomic<float>> volume;
-		std::shared_ptr<std::atomic<int>> fade_ms;
-		std::shared_ptr<std::atomic<bool>> limiter_enabled;
-		std::shared_ptr<std::atomic<float>> limiter_threshold_db;
-		std::shared_ptr<std::atomic<int>> limiter_release_ms;
+		PlaybackState() = default;
+		PlaybackState(const PlaybackState &) = delete;
+		PlaybackState &operator=(const PlaybackState &) = delete;
 
-		// Per-track runtime state.
-		uint64_t frames_sent{};
-		float limiter_gain{1.0F};
+		// Move (atomics are still copied; the rest can be moved)
+		PlaybackState(PlaybackState &&o) noexcept { move_from(std::move(o)); }
+
+		PlaybackState &operator=(PlaybackState &&o) noexcept {
+			if (this != &o) { move_from(std::move(o)); }
+			return *this;
+		}
+
+		~PlaybackState() = default;
+
+	   private:
+		void move_from(PlaybackState &&o) {
+			// Atomics: copy snapshot
+			volume.store(o.volume.load(std::memory_order_relaxed),
+						 std::memory_order_relaxed);
+			fade_ms.store(o.fade_ms.load(std::memory_order_relaxed),
+						  std::memory_order_relaxed);
+			limiter_enabled.store(
+				o.limiter_enabled.load(std::memory_order_relaxed),
+				std::memory_order_relaxed);
+			limiter_threshold_db.store(
+				o.limiter_threshold_db.load(std::memory_order_relaxed),
+				std::memory_order_relaxed);
+			limiter_release_ms.store(
+				o.limiter_release_ms.load(std::memory_order_relaxed),
+				std::memory_order_relaxed);
+
+			// Non-atomics: real move
+			running = o.running;
+			paused = o.paused;
+			pause_started = o.pause_started;
+			paused_total = o.paused_total;
+			track_started = o.track_started;
+
+			frames_sent = o.frames_sent;
+			limiter_gain = o.limiter_gain;
+
+			active_stream = std::move(o.active_stream);
+		}
 	};
 
 	struct TrackMetadata {

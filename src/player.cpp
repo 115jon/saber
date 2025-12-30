@@ -7,12 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <boost/algorithm/string.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/process/v2.hpp>
 #include <boost/scope_exit.hpp>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 #include <saber/audio_dsp.hpp>
 #include <saber/player.hpp>
+#include <saber/ring_buffer.hpp>
 #include <utility>
 #include <vector>
 
@@ -37,21 +38,11 @@ struct Player::StreamResources {
 		: rp{ex}, ep{ex}, proc{ex, exe, args, bp::process_stdio{{}, rp, ep}} {}
 
 	void cancel() {
-		// Goal: make skip/previous reliably interrupt *blocked reads* and stop
-		// the child process quickly.
 		boost::system::error_code ignored;
-
-		// 1) Abort any in-flight operations.
 		rp.cancel(ignored);
 		ep.cancel(ignored);
-
-		// 2) Force the read side to unblock even if nothing was pending at the
-		//    exact moment of cancel().
 		rp.close(ignored);
 		ep.close(ignored);
-
-		// 3) Ask process to exit (best-effort), then hard-terminate as
-		// fallback.
 		proc.request_exit(ignored);
 		proc.terminate(ignored);
 	}
@@ -66,26 +57,20 @@ static constexpr auto k_previous_restart_threshold = std::chrono::seconds(5);
 namespace {
 
 std::string trim_copy(std::string s) {
-	while (!s.empty() &&
-		   (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
-		s.pop_back();
-	}
-	while (!s.empty() &&
-		   (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
-		s.erase(0, 1);
-	}
+	boost::algorithm::trim(s);
 	return s;
 }
 
 std::string make_search_arg(std::string_view query) {
-	if (query.find("http") == 0) { return std::string{query}; }
+	if (boost::algorithm::starts_with(query, "http")) {
+		return std::string{query};
+	}
 	return fmt::format("ytsearch1:{}", query);
 }
 
 Result<std::string> read_process_stdout(
 	bp::process &proc, asio::readable_pipe &rp, asio::readable_pipe &ep,
 	const asio::yield_context &yield) {
-	// Drain stderr to avoid deadlock if it fills up.
 	asio::spawn(
 		yield.get_executor(),
 		[&ep](const auto &y) mutable {
@@ -100,7 +85,9 @@ Result<std::string> read_process_stdout(
 
 	boost::system::error_code ec;
 	std::string out;
+	out.reserve(8192);
 	std::array<char, 4096> chunk{};
+
 	while (true) {
 		auto n = rp.async_read_some(asio::buffer(chunk), yield[ec]);
 		if (n > 0) { out.append(chunk.data(), n); }
@@ -119,22 +106,17 @@ Result<std::string> read_process_stdout(
 
 std::vector<std::string> split_lines_nonempty(const std::string &s) {
 	std::vector<std::string> lines;
-	std::string cur;
-	cur.reserve(256);
+	lines.reserve(32);	// Typical case: avoid reallocations
 
-	for (char ch : s) {
-		if (ch == '\r') { continue; }
-		if (ch == '\n') {
-			auto t = trim_copy(cur);
-			if (!t.empty()) { lines.emplace_back(std::move(t)); }
-			cur.clear();
-			continue;
-		}
-		cur.push_back(ch);
-	}
+	boost::algorithm::split(lines, s, boost::algorithm::is_any_of("\r\n"),
+							boost::algorithm::token_compress_on);
 
-	auto t = trim_copy(cur);
-	if (!t.empty()) { lines.emplace_back(std::move(t)); }
+	lines.erase(std::remove_if(lines.begin(), lines.end(),
+							   [](std::string &line) {
+								   boost::algorithm::trim(line);
+								   return line.empty();
+							   }),
+				lines.end());
 
 	return lines;
 }
@@ -162,7 +144,6 @@ void write_file_atomic(const std::filesystem::path &final_path,
 	}
 	std::filesystem::remove(final_path, ec);
 	std::filesystem::rename(tmp_path, final_path, ec);
-	(void)ec;
 }
 
 }  // namespace
@@ -170,30 +151,26 @@ void write_file_atomic(const std::filesystem::path &final_path,
 Player::Player(Connector connector)
 	: m_connector(std::move(connector)), m_persist_pool(1) {}
 
-float Player::clamp_volume(float v) {
-	if (!std::isfinite(v)) { return 1.0F; }
-	if (v < 0.0F) { return 0.0F; }
-	if (v > 2.0F) { return 2.0F; }
-	return v;
+namespace {
+template <typename T>
+T clamp_value(T value, T min_val, T max_val, T default_val) {
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!std::isfinite(value)) { return default_val; }
+	}
+	return std::clamp(value, min_val, max_val);
 }
+}  // namespace
 
-int Player::clamp_fade_ms(int ms) {
-	if (ms < 0) { return 0; }
-	if (ms > 2000) { return 2000; }
-	return ms;
-}
+float Player::clamp_volume(float v) { return clamp_value(v, 0.0F, 2.0F, 1.0F); }
+
+int Player::clamp_fade_ms(int ms) { return clamp_value(ms, 0, 2000, 120); }
 
 float Player::clamp_limiter_threshold_db(float db) {
-	if (!std::isfinite(db)) { return -1.0F; }
-	db = std::min(db, 0.0F);
-	db = std::max(db, -30.0F);
-	return db;
+	return clamp_value(db, -30.0F, 0.0F, -1.0F);
 }
 
 int Player::clamp_limiter_release_ms(int ms) {
-	if (ms < 0) { ms = 0; }
-	if (ms > 2000) { ms = 2000; }
-	return ms;
+	return clamp_value(ms, 0, 2000, 120);
 }
 
 [[nodiscard]] bool Player::has_connection(ekizu::Snowflake guild_id) const {
@@ -215,104 +192,104 @@ Result<ekizu::Snowflake> Player::voice_channel_id(
 
 Result<float> Player::volume(ekizu::Snowflake guild_id) const {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.volume) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 	return outcome::success(
-		st_it->second.volume->load(std::memory_order_acquire));
+		st_it->second.volume.load(std::memory_order_acquire));
 }
 
 Result<> Player::set_volume(ekizu::Snowflake guild_id, float scalar) {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.volume) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
 	scalar = clamp_volume(scalar);
-	st_it->second.volume->store(scalar, std::memory_order_release);
+	st_it->second.volume.store(scalar, std::memory_order_release);
 	mark_persist_dirty(guild_id);
 	return outcome::success();
 }
 
 Result<int> Player::fade_ms(ekizu::Snowflake guild_id) const {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.fade_ms) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 	return outcome::success(
-		st_it->second.fade_ms->load(std::memory_order_acquire));
+		st_it->second.fade_ms.load(std::memory_order_acquire));
 }
 
 Result<> Player::set_fade_ms(ekizu::Snowflake guild_id, int ms) {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.fade_ms) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
 	ms = clamp_fade_ms(ms);
-	st_it->second.fade_ms->store(ms, std::memory_order_release);
+	st_it->second.fade_ms.store(ms, std::memory_order_release);
 	mark_persist_dirty(guild_id);
 	return outcome::success();
 }
 
 Result<bool> Player::limiter_enabled(ekizu::Snowflake guild_id) const {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_enabled) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 	return outcome::success(
-		st_it->second.limiter_enabled->load(std::memory_order_acquire));
+		st_it->second.limiter_enabled.load(std::memory_order_acquire));
 }
 
 Result<> Player::set_limiter_enabled(ekizu::Snowflake guild_id, bool enabled) {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_enabled) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
-	st_it->second.limiter_enabled->store(enabled, std::memory_order_release);
+	st_it->second.limiter_enabled.store(enabled, std::memory_order_release);
 	mark_persist_dirty(guild_id);
 	return outcome::success();
 }
 
 Result<float> Player::limiter_threshold_db(ekizu::Snowflake guild_id) const {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_threshold_db) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 	return outcome::success(
-		st_it->second.limiter_threshold_db->load(std::memory_order_acquire));
+		st_it->second.limiter_threshold_db.load(std::memory_order_acquire));
 }
 
 Result<> Player::set_limiter_threshold_db(ekizu::Snowflake guild_id, float db) {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_threshold_db) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
 	db = clamp_limiter_threshold_db(db);
-	st_it->second.limiter_threshold_db->store(db, std::memory_order_release);
+	st_it->second.limiter_threshold_db.store(db, std::memory_order_release);
 	mark_persist_dirty(guild_id);
 	return outcome::success();
 }
 
 Result<int> Player::limiter_release_ms(ekizu::Snowflake guild_id) const {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_release_ms) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 	return outcome::success(
-		st_it->second.limiter_release_ms->load(std::memory_order_acquire));
+		st_it->second.limiter_release_ms.load(std::memory_order_acquire));
 }
 
 Result<> Player::set_limiter_release_ms(ekizu::Snowflake guild_id, int ms) {
 	auto st_it = m_playback.find(guild_id);
-	if (st_it == m_playback.end() || !st_it->second.limiter_release_ms) {
+	if (st_it == m_playback.end()) {
 		return boost::system::errc::operation_not_permitted;
 	}
 
 	ms = clamp_limiter_release_ms(ms);
-	st_it->second.limiter_release_ms->store(ms, std::memory_order_release);
+	st_it->second.limiter_release_ms.store(ms, std::memory_order_release);
 	mark_persist_dirty(guild_id);
 	return outcome::success();
 }
@@ -352,20 +329,7 @@ Result<bool> Player::connect(ekizu::Snowflake guild_id,
 						  if (m_on_log) { m_on_log(std::move(l)); }
 					  }));
 
-	// Ensure playback state entry exists.
-	auto &st = m_playback[guild_id];
-	if (!st.volume) { st.volume = std::make_shared<std::atomic<float>>(1.0F); }
-	if (!st.fade_ms) { st.fade_ms = std::make_shared<std::atomic<int>>(120); }
-	if (!st.limiter_enabled) {
-		st.limiter_enabled = std::make_shared<std::atomic<bool>>(true);
-	}
-	if (!st.limiter_threshold_db) {
-		st.limiter_threshold_db = std::make_shared<std::atomic<float>>(-1.0F);
-	}
-	if (!st.limiter_release_ms) {
-		st.limiter_release_ms = std::make_shared<std::atomic<int>>(120);
-	}
-
+	(void)m_playback[guild_id];
 	mark_persist_dirty(guild_id);
 	return true;
 }
@@ -374,91 +338,65 @@ std::string Player::build_persist_json(ekizu::Snowflake guild_id) const {
 	nlohmann::json root = nlohmann::json::object();
 	root["guild_id"] = guild_id;
 
-	{
-		auto it = m_last_voice_channel.find(guild_id);
-		if (it != m_last_voice_channel.end()) {
-			root["voice_channel_id"] = it->second;
-		}
+	auto vc_it = m_last_voice_channel.find(guild_id);
+	if (vc_it != m_last_voice_channel.end()) {
+		root["voice_channel_id"] = vc_it->second;
 	}
 
-	{
-		auto it = m_playback.find(guild_id);
-		root["paused"] = (it != m_playback.end()) ? it->second.paused : false;
+	auto pb_it = m_playback.find(guild_id);
+	if (pb_it != m_playback.end()) {
+		const auto &st = pb_it->second;
+		root["paused"] = st.paused;
+		root["volume"] = st.volume.load(std::memory_order_acquire);
+		root["fade_ms"] = st.fade_ms.load(std::memory_order_acquire);
+		root["limiter_enabled"] =
+			st.limiter_enabled.load(std::memory_order_acquire);
+		root["limiter_threshold_db"] =
+			st.limiter_threshold_db.load(std::memory_order_acquire);
+		root["limiter_release_ms"] =
+			st.limiter_release_ms.load(std::memory_order_acquire);
+	} else {
+		root["paused"] = false;
+		root["volume"] = 1.0F;
+		root["fade_ms"] = 120;
+		root["limiter_enabled"] = true;
+		root["limiter_threshold_db"] = -1.0F;
+		root["limiter_release_ms"] = 120;
 	}
 
-	{
-		auto it = m_playback.find(guild_id);
-		float vol = 1.0F;
-		if (it != m_playback.end() && it->second.volume) {
-			vol = it->second.volume->load(std::memory_order_acquire);
-		}
-		root["volume"] = vol;
-	}
+	auto q_it = m_queues.find(guild_id);
+	if (q_it != m_queues.end() && q_it->second) {
+		const auto &q = *q_it->second;
+		nlohmann::json qj = nlohmann::json::object();
 
-	{
-		auto it = m_playback.find(guild_id);
-		int fade = 120;
-		bool lim_en = true;
-		float lim_db = -1.0F;
-		int lim_rel = 120;
-		if (it != m_playback.end()) {
-			if (it->second.fade_ms) {
-				fade = it->second.fade_ms->load(std::memory_order_acquire);
-			}
-			if (it->second.limiter_enabled) {
-				lim_en =
-					it->second.limiter_enabled->load(std::memory_order_acquire);
-			}
-			if (it->second.limiter_threshold_db) {
-				lim_db = it->second.limiter_threshold_db->load(
-					std::memory_order_acquire);
-			}
-			if (it->second.limiter_release_ms) {
-				lim_rel = it->second.limiter_release_ms->load(
-					std::memory_order_acquire);
+		if (q.current_track_id) {
+			qj["current_track_id"] = *q.current_track_id;
+		} else {
+			qj["current_track_id"] = nullptr;
+		}
+		qj["last_track_id"] = q.last_track_id;
+
+		nlohmann::json tracks = nlohmann::json::array();
+		if (q.current_track_id) {
+			auto it = std::find_if(
+				q.tracks.begin(), q.tracks.end(),
+				[&](const Track &t) { return t.id == *q.current_track_id; });
+			if (it == q.tracks.end()) { it = q.tracks.begin(); }
+
+			size_t count = 0;
+			for (; it != q.tracks.end() && count < k_persist_track_cap;
+				 ++it, ++count) {
+				nlohmann::json tj = nlohmann::json::object();
+				tj["id"] = it->id;
+				tj["requester_id"] = it->requester_id;
+				tj["webpage_url"] = it->webpage_url;
+				tj["title"] = it->title;
+				tracks.emplace_back(std::move(tj));
 			}
 		}
-		root["fade_ms"] = clamp_fade_ms(fade);
-		root["limiter_enabled"] = lim_en;
-		root["limiter_threshold_db"] = clamp_limiter_threshold_db(lim_db);
-		root["limiter_release_ms"] = clamp_limiter_release_ms(lim_rel);
-	}
 
-	{
-		auto q_it = m_queues.find(guild_id);
-		if (q_it != m_queues.end() && q_it->second) {
-			auto &q = *q_it->second;
-			nlohmann::json qj = nlohmann::json::object();
-			if (q.current_track_id) {
-				qj["current_track_id"] = *q.current_track_id;
-			} else {
-				qj["current_track_id"] = nullptr;
-			}
-			qj["last_track_id"] = q.last_track_id;
-
-			nlohmann::json tracks = nlohmann::json::array();
-			if (q.current_track_id) {
-				auto it = std::find_if(
-					q.tracks.begin(), q.tracks.end(), [&](const Track &t) {
-						return t.id == *q.current_track_id;
-					});
-				if (it == q.tracks.end()) { it = q.tracks.begin(); }
-
-				size_t count = 0;
-				for (; it != q.tracks.end() && count < k_persist_track_cap;
-					 ++it, ++count) {
-					nlohmann::json tj = nlohmann::json::object();
-					tj["id"] = it->id;
-					tj["requester_id"] = it->requester_id;
-					tj["webpage_url"] = it->webpage_url;
-					tj["title"] = it->title;
-					tracks.emplace_back(std::move(tj));
-				}
-			}
-
-			qj["tracks"] = std::move(tracks);
-			root["queue"] = std::move(qj);
-		}
+		qj["tracks"] = std::move(tracks);
+		root["queue"] = std::move(qj);
 	}
 
 	return root.dump();
@@ -528,6 +466,8 @@ Result<> Player::restore_all_impl(const asio::yield_context &yield) {
 
 	asio::post(m_persist_pool, [ch, ex = yield.get_executor()] {
 		std::vector<nlohmann::json> out;
+		out.reserve(64);
+
 		std::error_code ec;
 		if (std::filesystem::exists(k_player_state_dir, ec)) {
 			for (const auto &ent :
@@ -614,34 +554,11 @@ Result<> Player::restore_all_impl(const asio::yield_context &yield) {
 		st.paused = paused;
 		st.pause_started.reset();
 		st.paused_total = std::chrono::steady_clock::duration::zero();
-
-		if (!st.volume) {
-			st.volume = std::make_shared<std::atomic<float>>(vol);
-		} else {
-			st.volume->store(vol, std::memory_order_release);
-		}
-
-		if (!st.fade_ms) {
-			st.fade_ms = std::make_shared<std::atomic<int>>(fade);
-		} else {
-			st.fade_ms->store(fade, std::memory_order_release);
-		}
-		if (!st.limiter_enabled) {
-			st.limiter_enabled = std::make_shared<std::atomic<bool>>(lim_en);
-		} else {
-			st.limiter_enabled->store(lim_en, std::memory_order_release);
-		}
-		if (!st.limiter_threshold_db) {
-			st.limiter_threshold_db =
-				std::make_shared<std::atomic<float>>(lim_db);
-		} else {
-			st.limiter_threshold_db->store(lim_db, std::memory_order_release);
-		}
-		if (!st.limiter_release_ms) {
-			st.limiter_release_ms = std::make_shared<std::atomic<int>>(lim_rel);
-		} else {
-			st.limiter_release_ms->store(lim_rel, std::memory_order_release);
-		}
+		st.volume.store(vol, std::memory_order_release);
+		st.fade_ms.store(fade, std::memory_order_release);
+		st.limiter_enabled.store(lim_en, std::memory_order_release);
+		st.limiter_threshold_db.store(lim_db, std::memory_order_release);
+		st.limiter_release_ms.store(lim_rel, std::memory_order_release);
 
 		if (m_last_voice_channel.contains(guild_id)) {
 			(void)connect(guild_id, m_last_voice_channel[guild_id], yield);
@@ -698,8 +615,6 @@ void Player::cancel_active_stream(ekizu::Snowflake guild_id) {
 	auto &st = it->second;
 	if (st.active_stream) { st.active_stream->cancel(); }
 
-	// If playback is paused, send() can be blocked on the pause timer. Wake it
-	// so skip/previous can take effect immediately without leaking audio.
 	auto conn_it = m_connections.find(guild_id);
 	if (conn_it != m_connections.end() && conn_it->second) {
 		conn_it->second->interrupt_playback();
@@ -746,9 +661,6 @@ Result<bool> Player::previous(ekizu::Snowflake guild_id) {
 	auto &st = st_it->second;
 	auto elapsed = playback_elapsed(st);
 
-	// Spotify-like:
-	// - If >= threshold => restart current.
-	// - Else => go to previous track if exists, otherwise restart current.
 	if (elapsed < k_previous_restart_threshold) {
 		auto it = std::find_if(
 			q->tracks.begin(), q->tracks.end(),
@@ -776,8 +688,6 @@ Result<Player::TrackMetadata> Player::resolve_metadata(
 
 	const auto search_arg = make_search_arg(query);
 
-	// -O/--print supports printing a field name (implies --quiet and
-	// --simulate). We print webpage_url first, then title.
 	std::vector<std::string> args{
 		"--no-playlist",
 		"--no-warnings",
@@ -802,8 +712,6 @@ Result<Player::TrackMetadata> Player::resolve_metadata(
 
 	TrackMetadata meta;
 	meta.webpage_url = std::move(lines[0]);
-
-	// Title may (rarely) contain newlines; conservatively join any extra lines.
 	meta.title = std::move(lines[1]);
 	for (size_t i = 2; i < lines.size(); ++i) {
 		meta.title.append("\n");
@@ -839,17 +747,6 @@ Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 		"Enqueued track {} (Title: {})", track.id, track.title);
 
 	auto &st = m_playback[guild_id];
-	if (!st.volume) { st.volume = std::make_shared<std::atomic<float>>(1.0F); }
-	if (!st.fade_ms) { st.fade_ms = std::make_shared<std::atomic<int>>(120); }
-	if (!st.limiter_enabled) {
-		st.limiter_enabled = std::make_shared<std::atomic<bool>>(true);
-	}
-	if (!st.limiter_threshold_db) {
-		st.limiter_threshold_db = std::make_shared<std::atomic<float>>(-1.0F);
-	}
-	if (!st.limiter_release_ms) {
-		st.limiter_release_ms = std::make_shared<std::atomic<int>>(120);
-	}
 
 	if (!st.running) {
 		st.running = true;
@@ -886,18 +783,11 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 		return boost::system::errc::operation_not_permitted;
 	}
 
-	auto &st = m_playback[guild_id];
-	if (!st.volume) { st.volume = std::make_shared<std::atomic<float>>(1.0F); }
-	if (!st.fade_ms) { st.fade_ms = std::make_shared<std::atomic<int>>(120); }
-	if (!st.limiter_enabled) {
-		st.limiter_enabled = std::make_shared<std::atomic<bool>>(true);
+	auto st_it = m_playback.find(guild_id);
+	if (st_it == m_playback.end()) {
+		return boost::system::errc::operation_not_permitted;
 	}
-	if (!st.limiter_threshold_db) {
-		st.limiter_threshold_db = std::make_shared<std::atomic<float>>(-1.0F);
-	}
-	if (!st.limiter_release_ms) {
-		st.limiter_release_ms = std::make_shared<std::atomic<int>>(120);
-	}
+	PlaybackState &st = st_it->second;
 
 	while (true) {
 		if (conn->is_shutdown()) { break; }
@@ -917,8 +807,6 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 		const ekizu::Snowflake cur_requester_id = cur_it->requester_id;
 		const std::string cur_title = cur_it->title;
 
-		// Reset per-track timing, but preserve pause state across track
-		// changes.
 		const auto now = std::chrono::steady_clock::now();
 		st.track_started = now;
 		st.paused_total = std::chrono::steady_clock::duration::zero();
@@ -935,8 +823,6 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 			"Starting track {} (Title: {})", cur_track_id, cur_title);
 
 		if (st.paused) {
-			// Ensure PlayerConnection has a pause timer and is actually paused
-			// before we start sending real audio data.
 			boost::system::error_code ignored;
 			(void)conn->send_track_data(
 				{{}, false, cur_requester_id, cur_track_id}, yield[ignored]);
@@ -949,15 +835,12 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 
 		if (res.has_error()) {
 			if (res.error() == boost::system::errc::operation_canceled) {
-				// Skip/previous cancels the stream. Just loop and play whatever
-				// track is currently selected.
 				continue;
 			}
 
 			log<ekizu::LogLevel::Error>("Playback failed for track {}: {}",
 										cur_track_id, res.error().message());
 
-			// Try to advance to next track on errors.
 			if (q->current_track_id && (*q->current_track_id == cur_track_id)) {
 				auto it = std::find_if(
 					q->tracks.begin(), q->tracks.end(),
@@ -980,7 +863,6 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 			continue;
 		}
 
-		// Natural completion: advance only if user didn't change the selection.
 		if (!q->current_track_id || (*q->current_track_id != cur_track_id)) {
 			continue;
 		}
@@ -1003,7 +885,6 @@ Result<> Player::playback_loop(ekizu::Snowflake guild_id,
 		break;
 	}
 
-	// Stop speaking when done (best-effort).
 	{
 		boost::system::error_code ignored;
 		(void)conn->stop_speaking(yield[ignored]);
@@ -1067,7 +948,6 @@ Result<> Player::resume(ekizu::Snowflake guild_id) {
 void Player::shutdown() {
 	log<ekizu::LogLevel::Info>("Player shutting down...");
 
-	// Cancel any active ffmpeg/yt-dlp streams first to unblock read loops.
 	for (auto &[guild_id, st] : m_playback) {
 		if (st.active_stream) { st.active_stream->cancel(); }
 	}
@@ -1087,7 +967,6 @@ void Player::shutdown() {
 		std::lock_guard<std::mutex> lock(m_persist_mutex);
 		m_persist_entries.clear();
 	}
-	// Wait for any in-flight persistence tasks to complete (best-effort).
 	m_persist_pool.stop();
 	m_persist_pool.join();
 
@@ -1116,14 +995,19 @@ Result<std::string> Player::resolve_url(ekizu::Snowflake guild_id,
 	auto resources =
 		std::make_shared<StreamResources>(yield.get_executor(), exe, args);
 
-	auto &st = m_playback[guild_id];
-	st.active_stream = resources;
+	auto st_it = m_playback.find(guild_id);
+	if (st_it == m_playback.end()) {
+		return boost::system::errc::operation_not_permitted;
+	}
 
-	BOOST_SCOPE_EXIT_ALL(&st, &resources) {
-		if (st.active_stream == resources) { st.active_stream.reset(); }
+	st_it->second.active_stream = resources;
+
+	BOOST_SCOPE_EXIT_ALL(&st_it, &resources) {
+		if (st_it->second.active_stream == resources) {
+			st_it->second.active_stream.reset();
+		}
 	};
 
-	// Spawn a coroutine to drain stderr (prevent deadlock)
 	asio::spawn(
 		yield.get_executor(),
 		[resources](const auto &y) mutable {
@@ -1138,15 +1022,15 @@ Result<std::string> Player::resolve_url(ekizu::Snowflake guild_id,
 		asio::detached);
 
 	std::string url;
+	url.reserve(512);
 	std::array<char, 4096> chunk{};
+
 	while (true) {
 		auto n = resources->rp.async_read_some(asio::buffer(chunk), yield[ec]);
 		if (n > 0) { url.append(chunk.data(), n); }
 		if (ec) { break; }
 	}
 
-	// If cancellation closes the pipe, Windows can surface that as
-	// bad_descriptor / invalid-handle instead of operation_aborted.
 	if (ec == asio::error::operation_aborted ||
 		ec == asio::error::bad_descriptor || !resources->rp.is_open()) {
 		return boost::system::errc::operation_canceled;
@@ -1190,13 +1074,11 @@ Result<> Player::play_sync(ekizu::Snowflake guild_id, Track &track,
 
 	PlayerConnection *conn = conn_it->second.get();
 
-	// Check if connection was shut down
 	if (conn->is_shutdown()) { return boost::system::errc::operation_canceled; }
 
 	auto res = stream_ffmpeg(
 		guild_id, conn, track.stream_url, track.requester_id, track.id, yield);
 
-	// Send final packet to signal track end (only if not shutting down)
 	if (!conn->is_shutdown()) {
 		boost::system::error_code ignore;
 		(void)conn->send_track_data(
@@ -1215,7 +1097,6 @@ Result<> Player::stream_ffmpeg(ekizu::Snowflake guild_id,
 		return boost::system::errc::no_such_file_or_directory;
 	}
 
-	// Decode to raw PCM so we can apply DSP in real-time before Opus encode.
 	std::vector<std::string> args{
 		"-reconnect",
 		"1",
@@ -1245,10 +1126,13 @@ Result<> Player::stream_ffmpeg(ekizu::Snowflake guild_id,
 	auto resources = std::make_shared<StreamResources>(
 		yield.get_executor(), ffmpeg_exe, args);
 
-	auto &st = m_playback[guild_id];
-	st.active_stream = resources;
+	auto st_it = m_playback.find(guild_id);
+	if (st_it == m_playback.end()) {
+		return boost::system::errc::operation_not_permitted;
+	}
 
-	// Spawn a coroutine to drain stderr
+	st_it->second.active_stream = resources;
+
 	asio::spawn(
 		yield.get_executor(),
 		[resources](const auto &y) mutable {
@@ -1262,10 +1146,10 @@ Result<> Player::stream_ffmpeg(ekizu::Snowflake guild_id,
 		},
 		asio::detached);
 
-	BOOST_SCOPE_EXIT_ALL(&resources, &st) {
+	BOOST_SCOPE_EXIT_ALL(&resources, &st_it) {
 		boost::system::error_code ignore;
 		resources->proc.request_exit(ignore);
-		st.active_stream.reset();
+		st_it->second.active_stream.reset();
 	};
 
 	log<ekizu::LogLevel::Info>("Starting ffmpeg stream for track {}", track_id);
@@ -1280,11 +1164,12 @@ Result<> Player::process_pcm_stream(
 	static constexpr int k_sample_rate = 48000;
 	static constexpr int k_channels = 2;
 	static constexpr int k_frame_ms = 20;
-	static constexpr int k_frame_samples = 960;	 // 20ms @ 48k
-	static constexpr size_t k_frame_bytes =
+	static constexpr int k_frame_samples = 960;
+	static constexpr auto k_frame_bytes =
 		static_cast<size_t>(k_frame_samples * k_channels * sizeof(int16_t));
-	static constexpr size_t k_pcm_samples =
+	static constexpr auto k_pcm_samples =
 		static_cast<size_t>(k_frame_samples * k_channels);
+	static constexpr size_t k_settings_refresh_interval = 50;
 
 	using Frame = std::array<opus_int16, k_frame_samples * k_channels>;
 
@@ -1296,17 +1181,15 @@ Result<> Player::process_pcm_stream(
 	}
 	BOOST_SCOPE_EXIT_ALL(&encoder) { opus_encoder_destroy(encoder); };
 
-	// 128k default-ish for music bot use.
 	(void)opus_encoder_ctl(encoder, OPUS_SET_BITRATE(128000));
 
-	// Capture fade settings once per track (buffer sizing needs stability).
-	int fade_ms_cfg = 120;
-	if (auto st_it = m_playback.find(guild_id); st_it != m_playback.end()) {
-		if (st_it->second.fade_ms) {
-			fade_ms_cfg =
-				st_it->second.fade_ms->load(std::memory_order_acquire);
-		}
+	auto st_it = m_playback.find(guild_id);
+	if (st_it == m_playback.end()) {
+		return boost::system::errc::operation_not_permitted;
 	}
+	PlaybackState &state = st_it->second;
+
+	int fade_ms_cfg = state.fade_ms.load(std::memory_order_acquire);
 	fade_ms_cfg = clamp_fade_ms(fade_ms_cfg);
 	const size_t fade_frames =
 		(fade_ms_cfg <= 0)
@@ -1315,64 +1198,74 @@ Result<> Player::process_pcm_stream(
 
 	std::deque<Frame> delay;
 
-	// Persistent buffer – outlives any pending async operation.
+	RingBuffer pending(65536);
+
 	auto read_buffer = std::make_shared<std::vector<uint8_t>>(8192);
-	std::vector<uint8_t> pending;
-	pending.reserve(32768);
+	std::array<uint8_t, 4096> opus_buf{};
+	Frame pcm_frame{};
+
+	struct CachedSettings {
+		float volume{1.0F};
+		bool limiter_enabled{true};
+		float limiter_threshold_db{-1.0F};
+		int limiter_release_ms{120};
+		size_t frames_until_refresh{0};
+
+		void refresh(PlaybackState &st) {
+			volume = st.volume.load(std::memory_order_acquire);
+			limiter_enabled =
+				st.limiter_enabled.load(std::memory_order_acquire);
+			limiter_threshold_db =
+				st.limiter_threshold_db.load(std::memory_order_acquire);
+			limiter_release_ms =
+				st.limiter_release_ms.load(std::memory_order_acquire);
+
+			limiter_threshold_db =
+				clamp_limiter_threshold_db(limiter_threshold_db);
+			limiter_release_ms = clamp_limiter_release_ms(limiter_release_ms);
+
+			frames_until_refresh = k_settings_refresh_interval;
+		}
+	};
+
+	CachedSettings settings;
+	settings.refresh(state);
 
 	boost::system::error_code ec;
+	size_t frames_since_shutdown_check = 0;
 
-	auto send_frame = [&](Frame &pcm_frame, float extra_gain) -> Result<> {
-		float vol = 1.0F;
-		bool lim_en = true;
-		float lim_db = -1.0F;
-		int lim_rel = 120;
+	auto send_frame_inline = [&](float extra_gain) -> Result<> {
+		if (--settings.frames_until_refresh == 0) { settings.refresh(state); }
 
-		auto st_it = m_playback.find(guild_id);
-		if (st_it != m_playback.end()) {
-			auto &st = st_it->second;
-
-			if (st.volume) { vol = st.volume->load(std::memory_order_acquire); }
-
-			float fade_in = 1.0F;
-			if (fade_frames > 0 && st.frames_sent < fade_frames) {
-				fade_in = static_cast<float>(st.frames_sent + 1) /
-						  static_cast<float>(fade_frames);
-				fade_in = std::min(fade_in, 1.0F);
-			}
-
-			if (st.limiter_enabled) {
-				lim_en = st.limiter_enabled->load(std::memory_order_acquire);
-			}
-			if (st.limiter_threshold_db) {
-				lim_db =
-					st.limiter_threshold_db->load(std::memory_order_acquire);
-			}
-			if (st.limiter_release_ms) {
-				lim_rel =
-					st.limiter_release_ms->load(std::memory_order_acquire);
-			}
-
-			lim_db = clamp_limiter_threshold_db(lim_db);
-			lim_rel = clamp_limiter_release_ms(lim_rel);
-
-			audio::apply_gain_i16(reinterpret_cast<int16_t *>(pcm_frame.data()),
-								  k_pcm_samples, vol * fade_in * extra_gain);
-
-			audio::LimiterState lst{st.limiter_gain};
-			audio::apply_peak_limiter_i16(
-				reinterpret_cast<int16_t *>(pcm_frame.data()), k_pcm_samples,
-				lst, lim_en, lim_db, k_frame_ms, lim_rel);
-			st.limiter_gain = lst.gain;
-		} else {
-			audio::apply_gain_i16(reinterpret_cast<int16_t *>(pcm_frame.data()),
-								  k_pcm_samples, vol * extra_gain);
+		float fade_in = 1.0F;
+		if (fade_frames > 0 && state.frames_sent < fade_frames) {
+			fade_in = static_cast<float>(state.frames_sent + 1) /
+					  static_cast<float>(fade_frames);
+			fade_in = std::min(fade_in, 1.0F);
 		}
 
-		std::array<uint8_t, 4096> opus_buf{};
+		const float total_gain = settings.volume * fade_in * extra_gain;
+
+#ifdef __x86_64__
+		audio::apply_gain_i16_simd(
+			reinterpret_cast<int16_t *>(pcm_frame.data()), k_pcm_samples,
+			total_gain);
+#else
+		audio::apply_gain_i16(reinterpret_cast<int16_t *>(pcm_frame.data()),
+							  k_pcm_samples, total_gain);
+#endif
+
+		audio::LimiterState lst{state.limiter_gain};
+		audio::apply_peak_limiter_i16(
+			reinterpret_cast<int16_t *>(pcm_frame.data()), k_pcm_samples, lst,
+			settings.limiter_enabled, settings.limiter_threshold_db, k_frame_ms,
+			settings.limiter_release_ms);
+		state.limiter_gain = lst.gain;
+
 		int encoded = opus_encode(
 			encoder, pcm_frame.data(), k_frame_samples, opus_buf.data(),
 			static_cast<opus_int32>(opus_buf.size()));
+
 		if (encoded < 0) {
 			log<ekizu::LogLevel::Error>(
 				"Opus encode failed for track {}: {}", track_id, encoded);
@@ -1400,31 +1293,25 @@ Result<> Player::process_pcm_stream(
 			return res;
 		}
 
-		// Advance fade timing only when a frame was actually sent.
-		if (auto st_it2 = m_playback.find(guild_id);
-			st_it2 != m_playback.end()) {
-			++st_it2->second.frames_sent;
-		}
-
+		++state.frames_sent;
 		return outcome::success();
 	};
 
 	while (true) {
-		// Check if connection was shut down.
-		if (conn->is_shutdown()) {
-			log<ekizu::LogLevel::Info>(
-				"Connection shutdown detected, stopping track {}", track_id);
-			return boost::system::errc::operation_canceled;
+		if (++frames_since_shutdown_check >= 10) {
+			frames_since_shutdown_check = 0;
+			if (conn->is_shutdown()) {
+				log<ekizu::LogLevel::Info>(
+					"Connection shutdown detected, stopping track {}",
+					track_id);
+				return boost::system::errc::operation_canceled;
+			}
 		}
 
 		read_buffer->resize(8192);
 		size_t bytes_read =
 			rp.async_read_some(asio::buffer(*read_buffer), yield[ec]);
 
-		// Handle cancellation gracefully.
-		//
-		// On Windows, closing the pipe to force-cancel can surface as
-		// bad_descriptor / invalid-handle, not just operation_aborted.
 		if (ec == asio::error::operation_aborted ||
 			ec == asio::error::bad_descriptor || !rp.is_open()) {
 			log<ekizu::LogLevel::Info>(
@@ -1443,52 +1330,41 @@ Result<> Player::process_pcm_stream(
 
 		if (bytes_read == 0) { break; }
 
-		read_buffer->resize(bytes_read);
-		pending.insert(pending.end(), read_buffer->begin(), read_buffer->end());
+		pending.write(read_buffer->data(), bytes_read);
 
 		while (pending.size() >= k_frame_bytes) {
-			Frame in{};
-			std::memcpy(in.data(), pending.data(), k_frame_bytes);
-			pending.erase(
-				pending.begin(),
-				pending.begin() + static_cast<std::ptrdiff_t>(k_frame_bytes));
+			pending.read(
+				reinterpret_cast<uint8_t *>(pcm_frame.data()), k_frame_bytes);
 
 			if (fade_frames > 0) {
-				delay.push_back(in);
-
-				// Delay output by fade_frames, so we can fade out on natural
-				// EOF.
+				delay.push_back(pcm_frame);
 				if (delay.size() <= fade_frames) { continue; }
-
-				auto out = delay.front();
+				pcm_frame = delay.front();
 				delay.pop_front();
-				SABER_TRY(send_frame(out, 1.0F));
-				continue;
+				SABER_TRY(send_frame_inline(1.0F));
+			} else {
+				SABER_TRY(send_frame_inline(1.0F));
 			}
-
-			SABER_TRY(send_frame(in, 1.0F));
 		}
 	}
 
-	// Natural completion: if fade is enabled, drain delayed frames with
-	// fade-out.
 	if (fade_frames > 0 && !delay.empty()) {
-		size_t remaining = delay.size();
+		const size_t remaining = delay.size();
+		const float fade_step =
+			(remaining > 1) ? 1.0F / static_cast<float>(remaining - 1) : 0.0F;
+
 		for (size_t i = 0; i < remaining; ++i) {
-			auto out = delay.front();
+			pcm_frame = delay.front();
 			delay.pop_front();
 
-			float fade_out = 0.0F;
-			if (remaining <= 1) {
-				fade_out = 0.0F;
-			} else {
-				fade_out = static_cast<float>(remaining - i - 1) /
-						   static_cast<float>(remaining - 1);
-			}
-			fade_out = std::min(fade_out, 1.0F);
-			fade_out = std::max(fade_out, 0.0F);
+			const float fade_out =
+				(remaining > 1)
+					? std::clamp(
+						  static_cast<float>(remaining - i - 1) * fade_step,
+						  0.0F, 1.0F)
+					: 0.0F;
 
-			auto r = send_frame(out, fade_out);
+			auto r = send_frame_inline(fade_out);
 			if (r.has_error()) { return r; }
 		}
 	}

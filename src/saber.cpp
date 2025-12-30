@@ -406,7 +406,7 @@ void Saber::handle_event(ekizu::Event ev,
 				};
 			},
 			[this](ekizu::Resumed) { log<ekizu::LogLevel::Info>("Resumed"); },
-			[this](const auto &e) {
+			[](const auto & /*e*/) {
 				// log<ekizu::LogLevel::Warn>(
 				// 	"Unhandled event: {}", nlohmann::json{e}.dump());
 			}},
