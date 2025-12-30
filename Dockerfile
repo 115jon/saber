@@ -1,7 +1,9 @@
+# syntax=docker/dockerfile:1.7-labs
+
 FROM ubuntu:20.04 AS build
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 WORKDIR /app
-
 ARG DEBIAN_FRONTEND=noninteractive
 
 # vcpkg location (so CMake/tooling can find it consistently)
@@ -10,73 +12,93 @@ ENV CXX=/usr/bin/g++
 ENV VCPKG_ROOT=/opt/vcpkg
 ENV PATH=${PATH}:${VCPKG_ROOT}
 
+RUN <<'EOF'
+set -euxo pipefail
+apt-get update
+apt-get install -y --no-install-recommends \
+  autoconf automake build-essential cmake git libtool ninja-build \
+  ca-certificates curl zip unzip tar pkg-config \
+  wget xz-utils file
+rm -rf /var/lib/apt/lists/*
+EOF
+
+RUN <<'EOF'
+set -euxo pipefail
+if [ ! -d "${VCPKG_ROOT}" ]; then
+  git clone --depth=1 https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+fi
+cd "${VCPKG_ROOT}"
+./bootstrap-vcpkg.sh
+EOF
+
 RUN --mount=type=bind,source=commands,target=commands \
     --mount=type=bind,source=include,target=include \
-    --mount=type=bind,source=overlay-ports,target=overlay-ports \
+    --mount=type=bind,source=extern,target=extern \
     --mount=type=bind,source=src,target=src \
     --mount=type=bind,source=CMakeLists.txt,target=CMakeLists.txt \
     --mount=type=bind,source=vcpkg-configuration.json,target=vcpkg-configuration.json \
     --mount=type=bind,source=vcpkg.json,target=vcpkg.json \
-    <<EOF
-    set -ex
-    apt-get update
-    apt-get install -y \
-        autoconf build-essential cmake git libtool ninja-build \
-        ca-certificates curl zip unzip tar pkg-config
+    <<'EOF'
+set -euxo pipefail
 
-    # Install vcpkg (clone + bootstrap)
-    if [ ! -d "${VCPKG_ROOT}" ]; then
-        git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
-    fi
-    cd "${VCPKG_ROOT}"
-    ./bootstrap-vcpkg.sh
-    cd /app
+cmake -S. -Bbuild -DCMAKE_BUILD_TYPE=Release -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
 
-    # If you want vcpkg dependencies wired into your build, keep this toolchain flag:
-    cmake -S. -Bbuild -DCMAKE_BUILD_TYPE=Release -GNinja \
-      -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+# Optional: strip to reduce size of copied artifacts
+strip -s build/bin/* 2>/dev/null || true
+strip -s build/lib/* 2>/dev/null || true
 
-    cmake --build build --config Release
+mkdir -p /saber
+cp -a build/bin/* /saber/ 2>/dev/null || true
+cp -a build/lib/* /saber/ 2>/dev/null || true
 
-    mkdir /saber
-    cp build/bin/* build/lib/* /saber
-    cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /saber
-    cp /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /saber
-    cp /lib/x86_64-linux-gnu/libdl.so.2 /saber
-    cp /lib/x86_64-linux-gnu/librt.so.1 /saber
-    touch /saber/saber.log
-    chmod 777 /saber/saber.log
+touch /saber/saber.log
+chmod 666 /saber/saber.log
 EOF
 
-RUN <<EOF
-    set -ex
-    apt-get update
-    apt-get install -y wget
-    export ARCH=`uname -m`
+RUN <<'EOF'
+set -euxo pipefail
+ARCH="$(uname -m)"
+if [ "$ARCH" = "x86_64" ]; then ARCH='amd64'; fi
+if [ "$ARCH" = "aarch64" ]; then ARCH='arm64'; fi
 
-    if [ "$ARCH" = "x86_64" ]; then ARCH='amd64'; fi
-    if [ "$ARCH" = "aarch64" ]; then ARCH='arm64'; fi
-    wget -q "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-${ARCH}-static.tar.xz" -O - | tar -xJ -C /tmp/ --one-top-level=ffmpeg
-    chmod -R a+x /tmp/ffmpeg/*
-    mv $(find /tmp/ffmpeg/* -name ffmpeg) /saber/
-    mv $(find /tmp/ffmpeg/* -name ffprobe) /saber/
-    rm -rf /tmp/*
+wget -q "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-${ARCH}-static.tar.xz" -O /tmp/ffmpeg.tar.xz
+mkdir -p /tmp/ffmpeg
+tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg
 
-    if [ "$ARCH" = "amd64" ]; then
-        wget -q 'https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux' -O /saber/yt-dlp
-        chmod a+x /saber/yt-dlp
-    else
-        wget -q "https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux_${ARCH}" -O /saber/yt-dlp
-        chmod a+x /saber/yt-dlp
-    fi
+install -m 0755 "$(find /tmp/ffmpeg -type f -name ffmpeg  | head -n1)" /saber/ffmpeg
+install -m 0755 "$(find /tmp/ffmpeg -type f -name ffprobe | head -n1)" /saber/ffprobe
+
+if [ "$ARCH" = "amd64" ]; then
+  wget -q 'https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux' -O /saber/yt-dlp
+else
+  wget -q "https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux_${ARCH}" -O /saber/yt-dlp
+fi
+chmod 0755 /saber/yt-dlp
+
+rm -rf /tmp/*
 EOF
 
-RUN <<EOF
-    cp /lib/x86_64-linux-gnu/libpthread.so.0 /saber
+FROM debian:bookworm-slim AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN <<'EOF'
+set -eux
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates \
+  libstdc++6 \
+  libgcc-s1
+rm -rf /var/lib/apt/lists/*
 EOF
 
 WORKDIR /saber
-ENV PATH=${PATH}:.
+COPY --from=build /saber/ /saber/
+
+ENV PATH=/saber:${PATH}
+# Ensure your own shared libs in /saber are discoverable (safe now that we are not vendoring glibc libs).
+ENV LD_LIBRARY_PATH=/saber
 ENV SSL_CERT_DIR=/etc/ssl/certs
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
