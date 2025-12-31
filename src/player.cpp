@@ -43,19 +43,111 @@ Result<bool> Player::connect(ekizu::Snowflake guild_id,
 	state->last_voice_channel = channel_id;
 
 	log<ekizu::LogLevel::Info>("Connecting to guild {}", guild_id);
+
 	SABER_TRY(auto config, m_connector(guild_id, channel_id, yield));
 
-	auto log_cb = [this](ekizu::Log l) {
-		if (m_logger) { m_logger(std::move(l)); }
+	auto log_cb = [log = m_logger](ekizu::Log l) {
+		if (log) { log(std::move(l)); }
 	};
 
-	if (!state->queue) { state->queue = std::make_unique<GuildQueue>(log_cb); }
-
-	state->connection =
-		std::make_unique<PlayerConnection>(*config, state->queue.get(), log_cb);
+	if (!state->queue) { state->queue = std::make_shared<GuildQueue>(log_cb); }
+	state->connection = std::make_shared<PlayerConnection>(
+		std::move(config), state->queue.get(), log_cb);
 
 	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return true;
+}
+
+Result<> Player::disconnect(ekizu::Snowflake guild_id, bool clear_queue) {
+	auto *state = m_state_mgr.get(guild_id);
+	if (state == nullptr) {
+		return boost::system::errc::operation_not_permitted;
+	}
+
+	// Stop the current stream and wake any paused sender.
+	state->cancel_stream();
+
+	if (state->connection) {
+		state->connection->shutdown();
+		state->connection.reset();
+	}
+
+	if (clear_queue && state->queue) {
+		state->queue->tracks.clear();
+		state->queue->current_track_id.reset();
+		state->queue->last_track_id = {};
+	}
+
+	state->playback.running = false;
+	state->playback.paused = false;
+	state->playback.pause_started.reset();
+	state->playback.paused_total = std::chrono::steady_clock::duration::zero();
+	state->playback.active_stream.reset();
+
+	m_playback_ctrl.mark_persist_dirty(guild_id);
+	return outcome::success();
+}
+
+Result<> Player::on_voice_state_update(ekizu::Snowflake guild_id,
+									   const ekizu::VoiceState &voice_state) {
+	auto *state = m_state_mgr.get(guild_id);
+	if (state == nullptr) {
+		return boost::system::errc::operation_not_permitted;
+	}
+
+	if (voice_state.channel_id) {
+		const auto new_channel = *voice_state.channel_id;
+
+		// Channel move: pause transport while waiting for VOICE_SERVER_UPDATE,
+		// but do NOT reset playback/stream state.
+		if (state->last_voice_channel &&
+			(*state->last_voice_channel != new_channel)) {
+			log<ekizu::LogLevel::Info>("Voice channel move: {} -> {}",
+									   *state->last_voice_channel, new_channel);
+
+			state->last_voice_channel = new_channel;
+
+			if (state->connection) {
+				// Transport-level pause only (do not touch
+				// state->playback.paused).
+				(void)state->connection->pause();
+			}
+
+			m_playback_ctrl.mark_persist_dirty(guild_id);
+			return outcome::success();
+		}
+
+		state->last_voice_channel = new_channel;
+		m_playback_ctrl.mark_persist_dirty(guild_id);
+		return outcome::success();
+	}
+
+	// Bot disconnected from voice: drop the connection and stop playback,
+	// but keep queue by default.
+	return disconnect(guild_id, /*clear_queue=*/false);
+}
+
+Result<> Player::on_voice_server_update(ekizu::Snowflake guild_id,
+										ekizu::VoiceConnectionConfig config) {
+	auto *state = m_state_mgr.get(guild_id);
+	if (state == nullptr) {
+		return boost::system::errc::operation_not_permitted;
+	}
+
+	if (!state->connection) {
+		// Nothing to rebind yet.
+		return outcome::success();
+	}
+
+	SABER_TRY(state->connection->rebind_transport(std::move(config)));
+
+	// If playback is running and the user didn't explicitly pause,
+	// resume transport sending.
+	if (state->playback.running && !state->playback.paused) {
+		return state->connection->resume();
+	}
+
+	return outcome::success();
 }
 
 Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
@@ -79,6 +171,7 @@ Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 
 	ensure_playback(guild_id, state, yield);
 	m_playback_ctrl.mark_persist_dirty(guild_id);
+
 	return track;
 }
 
@@ -92,6 +185,7 @@ Result<bool> Player::skip(ekizu::Snowflake guild_id) {
 			[id = *q->current_track_id](const auto &t) { return t.id == id; });
 
 		if (it == tracks.end()) { return false; }
+
 		auto next = std::next(it);
 		if (next == tracks.end()) { return false; }
 
@@ -117,6 +211,7 @@ Result<bool> Player::previous(ekizu::Snowflake guild_id) {
 				q->current_track_id = std::prev(it)->id;
 			}
 		}
+
 		state->cancel_stream();
 		return true;
 	});
@@ -126,6 +221,7 @@ Result<bool> Player::skip_to(ekizu::Snowflake guild_id, uint64_t track_id) {
 	return modify_state(guild_id, [track_id](GuildState *state, GuildQueue *q) {
 		if (!q->current_track_id) { return false; }
 		if (*q->current_track_id == track_id) { return false; }
+
 		if (!q->skip(track_id)) { return false; }
 
 		state->cancel_stream();
@@ -144,6 +240,7 @@ Result<bool> Player::shuffle(ekizu::Snowflake guild_id) {
 								   [id = *q->current_track_id](const auto &t) {
 									   return t.id == id;
 								   });
+
 			if (it == tracks.end()) { return false; }
 			start_it = std::next(it);
 		}
@@ -166,11 +263,13 @@ Result<bool> Player::clear(ekizu::Snowflake guild_id) {
 								   [id = *q->current_track_id](const auto &t) {
 									   return t.id == id;
 								   });
+
 			if (it == tracks.end()) { return false; }
 			start_it = std::next(it);
 		}
 
 		if (start_it == tracks.end()) { return false; }
+
 		tracks.erase(start_it, tracks.end());
 		return true;
 	});
@@ -185,9 +284,9 @@ Result<> Player::pause(ekizu::Snowflake guild_id) {
 	if (state->playback.running && !state->playback.paused) {
 		state->playback.paused = true;
 		state->playback.pause_started = std::chrono::steady_clock::now();
+		m_playback_ctrl.mark_persist_dirty(guild_id);
 	}
 
-	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return state->connection->pause();
 }
 
@@ -199,14 +298,15 @@ Result<> Player::resume(ekizu::Snowflake guild_id) {
 
 	if (state->playback.running && state->playback.paused) {
 		if (state->playback.pause_started) {
-			state->playback.paused_total += std::chrono::steady_clock::now() -
-											*state->playback.pause_started;
+			state->playback.paused_total += (std::chrono::steady_clock::now() -
+											 *state->playback.pause_started);
+			state->playback.pause_started.reset();
 		}
-		state->playback.pause_started.reset();
+
 		state->playback.paused = false;
+		m_playback_ctrl.mark_persist_dirty(guild_id);
 	}
 
-	m_playback_ctrl.mark_persist_dirty(guild_id);
 	return state->connection->resume();
 }
 
@@ -237,15 +337,15 @@ Result<> Player::restore_all(const asio::yield_context &yield) {
 
 	for (auto &data : states) {
 		auto *state = m_state_mgr.get_or_create(data.guild_id);
-
 		state->last_voice_channel = data.voice_channel_id;
 		state->audio = data.audio;
 		state->playback.paused = data.paused;
 
 		if (!state->queue) {
-			state->queue = std::make_unique<GuildQueue>([this](ekizu::Log l) {
-				if (m_logger) { m_logger(std::move(l)); }
-			});
+			state->queue =
+				std::make_shared<GuildQueue>([log = m_logger](ekizu::Log l) {
+					if (log) { log(std::move(l)); }
+				});
 		}
 
 		state->queue->current_track_id = data.queue.current_track_id;
@@ -253,11 +353,12 @@ Result<> Player::restore_all(const asio::yield_context &yield) {
 		state->queue->tracks = std::move(data.queue.tracks);
 
 		if (state->last_voice_channel) {
-			(void)connect(data.guild_id, *state->last_voice_channel, yield);
-		}
+			SABER_TRY(
+				connect(data.guild_id, *state->last_voice_channel, yield));
 
-		if (state->connection && state->queue->current_track_id) {
-			ensure_playback(data.guild_id, state, yield);
+			if (state->connection && state->queue->current_track_id) {
+				ensure_playback(data.guild_id, state, yield);
+			}
 		}
 	}
 

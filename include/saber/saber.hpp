@@ -74,7 +74,7 @@ struct Saber {
 	[[nodiscard]] SABER_EXPORT Result<ekizu::Permissions> get_guild_permissions(
 		ekizu::Snowflake guild_id, ekizu::Snowflake user_id);
 
-	[[nodiscard]] SABER_EXPORT Result<ekizu::VoiceConnectionConfig *>
+	[[nodiscard]] SABER_EXPORT Result<ekizu::VoiceConnectionConfig>
 	join_voice_channel(ekizu::Snowflake guild_id, ekizu::Snowflake channel_id,
 					   const boost::asio::yield_context &yield);
 
@@ -142,7 +142,7 @@ struct Saber {
 	std::unordered_map<ekizu::Snowflake, ekizu::VoiceConnectionConfig>
 		m_voice_configs{500};
 	ekizu::SnowflakeLruCache<boost::asio::experimental::channel<void(
-		boost::system::error_code, ekizu::VoiceConnectionConfig *)>>
+		boost::system::error_code, ekizu::VoiceConnectionConfig)>>
 		m_voice_ready_channels{500};
 	ekizu::SnowflakeLruCache<ekizu::SnowflakeLruCache<ekizu::VoiceState>>
 		m_voice_state_cache{500};

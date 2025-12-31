@@ -3,8 +3,11 @@
 
 namespace saber {
 
-void GuildState::cancel_stream() const {
-	if (playback.active_stream) { playback.active_stream->cancel(); }
+void GuildState::cancel_stream() {
+	if (playback.active_stream) {
+		playback.active_stream->cancel();
+		playback.active_stream_track_id.reset();
+	}
 	if (connection) { connection->interrupt_playback(); }
 }
 

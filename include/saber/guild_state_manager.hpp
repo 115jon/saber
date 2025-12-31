@@ -21,6 +21,7 @@ struct PlaybackState {
 	std::atomic<size_t> frames_sent{0};
 	std::atomic<float> limiter_gain{1.0F};
 	std::shared_ptr<StreamResources> active_stream;
+	std::optional<uint64_t> active_stream_track_id;
 };
 
 struct GuildState {
@@ -48,7 +49,7 @@ struct GuildState {
 				   : (now - playback.track_started) - paused;
 	}
 
-	void cancel_stream() const;
+	void cancel_stream();
 };
 
 struct GuildStateManager {

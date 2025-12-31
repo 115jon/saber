@@ -1,13 +1,21 @@
 #ifndef SABER_PLAYER_HPP
 #define SABER_PLAYER_HPP
 
+#include <saber/export.h>
+
+#include <boost/asio/spawn.hpp>
+#include <ekizu/snowflake.hpp>
+#include <ekizu/voice_state.hpp>
+#include <functional>
 #include <saber/playback_controller.hpp>
+#include <saber/result.hpp>
 #include <saber/stream_manager.hpp>
+#include <string_view>
 
 namespace saber {
 
 struct Player {
-	using Connector = std::function<Result<ekizu::VoiceConnectionConfig *>(
+	using Connector = std::function<Result<ekizu::VoiceConnectionConfig>(
 		ekizu::Snowflake, ekizu::Snowflake, const asio::yield_context &)>;
 
 	explicit Player(Connector connector);
@@ -17,8 +25,22 @@ struct Player {
 									  ekizu::Snowflake channel_id,
 									  const asio::yield_context &yield);
 
+	// Disconnect voice + stop playback; optionally clears the queue for this
+	// guild
+	SABER_EXPORT Result<> disconnect(ekizu::Snowflake guild_id,
+									 bool clear_queue = true);
+
+	SABER_EXPORT Result<> on_voice_state_update(
+		ekizu::Snowflake guild_id, const ekizu::VoiceState &voice_state);
+
+	// Used to rebind the voice transport on channel moves without resetting
+	// playback state.
+	SABER_EXPORT Result<> on_voice_server_update(
+		ekizu::Snowflake guild_id, ekizu::VoiceConnectionConfig config);
+
 	SABER_EXPORT Result<ekizu::Snowflake> voice_channel_id(
 		ekizu::Snowflake guild_id) const;
+
 	SABER_EXPORT bool has_connection(ekizu::Snowflake guild_id) const;
 	SABER_EXPORT bool has_queue(ekizu::Snowflake guild_id) const;
 
@@ -33,21 +55,26 @@ struct Player {
 									  uint64_t track_id);
 	SABER_EXPORT Result<bool> shuffle(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<bool> clear(ekizu::Snowflake guild_id);
+
 	SABER_EXPORT Result<> pause(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<> resume(ekizu::Snowflake guild_id);
 
 	// Audio settings (delegated to state manager)
 	SABER_EXPORT Result<float> volume(ekizu::Snowflake guild_id) const;
 	SABER_EXPORT Result<> set_volume(ekizu::Snowflake guild_id, float scalar);
+
 	SABER_EXPORT Result<int> fade_ms(ekizu::Snowflake guild_id) const;
 	SABER_EXPORT Result<> set_fade_ms(ekizu::Snowflake guild_id, int ms);
+
 	SABER_EXPORT Result<bool> limiter_enabled(ekizu::Snowflake guild_id) const;
 	SABER_EXPORT Result<> set_limiter_enabled(ekizu::Snowflake guild_id,
 											  bool enabled);
+
 	SABER_EXPORT Result<float> limiter_threshold_db(
 		ekizu::Snowflake guild_id) const;
 	SABER_EXPORT Result<> set_limiter_threshold_db(ekizu::Snowflake guild_id,
 												   float db);
+
 	SABER_EXPORT Result<int> limiter_release_ms(
 		ekizu::Snowflake guild_id) const;
 	SABER_EXPORT Result<> set_limiter_release_ms(ekizu::Snowflake guild_id,
@@ -64,7 +91,8 @@ struct Player {
 
 	// Logging
 	void attach_logger(std::function<void(ekizu::Log)> logger) {
-		m_logger = std::move(logger);
+		m_logger = logger;
+		m_playback_ctrl.attach_logger(std::move(logger));
 	}
 
    private:
@@ -74,18 +102,21 @@ struct Player {
 	// Component managers
 	StreamManager m_stream_mgr;
 	AudioProcessor m_audio_proc;
+
 	GuildStateManager m_state_mgr{[this](ekizu::Log l) {
 		if (m_logger) { m_logger(std::move(l)); }
 	}};
+
 	PersistenceManager m_persist_mgr{1};
+
 	PlaybackController m_playback_ctrl{
 		m_stream_mgr, m_audio_proc, m_state_mgr, m_persist_mgr};
 
 	void ensure_playback(ekizu::Snowflake guild_id, GuildState *state,
 						 const asio::yield_context &yield) {
 		if (state->playback.running) { return; }
-
 		state->playback.running = true;
+
 		asio::spawn(
 			yield,
 			[this, guild_id](const auto &y) {
@@ -118,10 +149,10 @@ struct Player {
 	}
 
 	template <ekizu::LogLevel Level, typename... Args>
-	void log(fmt::format_string<Args...> fmt, Args &&...args) const {
+	void log(fmt::format_string<Args...> fmtstr, Args &&...args) const {
 		if (!m_logger) { return; }
-		m_logger(
-			ekizu::Log{Level, fmt::format(fmt, std::forward<Args>(args)...)});
+		m_logger(ekizu::Log{
+			Level, fmt::format(fmtstr, std::forward<Args>(args)...)});
 	}
 };
 

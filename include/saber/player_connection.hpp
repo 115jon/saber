@@ -1,12 +1,16 @@
 #ifndef SABER_PLAYER_CONNECTION_HPP
 #define SABER_PLAYER_CONNECTION_HPP
 
+#include <fmt/format.h>
 #include <saber/export.h>
 
 #include <atomic>
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <cstdint>
 #include <ekizu/voice_connection.hpp>
+#include <functional>
+#include <optional>
 #include <saber/guild_queue.hpp>
 #include <saber/result.hpp>
 
@@ -23,6 +27,10 @@ struct PlayerConnection {
 	// Wakes any paused send() so skip/previous can cancel deterministically.
 	SABER_EXPORT void interrupt_playback();
 
+	// Rebinds ONLY the voice transport (endpoint/token/state) while keeping
+	// playback/stream state intact.
+	SABER_EXPORT Result<> rebind_transport(ekizu::VoiceConnectionConfig config);
+
 	SABER_EXPORT Result<> send_track_data(
 		TrackData data, const boost::asio::yield_context &yield);
 
@@ -30,6 +38,7 @@ struct PlayerConnection {
 		const boost::asio::yield_context &yield);
 
 	void shutdown();
+
 	bool is_shutdown() const {
 		return m_shutdown.load(std::memory_order_acquire);
 	}
@@ -38,7 +47,6 @@ struct PlayerConnection {
 	template <ekizu::LogLevel level, typename... Args>
 	void log(fmt::format_string<Args...> fmtstr, Args &&...args) const {
 		if (!m_on_log) { return; }
-
 		m_on_log(ekizu::Log{
 			level,
 			fmt::format("player_connection{{speaking={}}}: {}", m_speaking,
@@ -49,19 +57,21 @@ struct PlayerConnection {
 	Result<> send(const TrackData &data,
 				  const boost::asio::yield_context &yield);
 
-	GuildQueue *m_queue;
-	ekizu::VoiceConnectionConfig m_config;
+	GuildQueue *m_queue{};
+	ekizu::VoiceConnectionConfig m_config{};
 	std::function<void(ekizu::Log)> m_on_log;
-	std::optional<ekizu::VoiceConnection> m_voice_connection;
 
+	std::optional<ekizu::VoiceConnection> m_voice_connection;
 	std::optional<boost::asio::steady_timer> m_task_timer;
 	std::optional<boost::asio::steady_timer> m_pause_timer;
 
 	uint64_t m_tasks{};
 	bool m_speaking{};
+
 	std::atomic<bool> m_shutdown{false};
 	std::atomic<bool> m_paused{false};
 	std::atomic<bool> m_interrupted{false};
+	std::atomic<bool> m_transport_rebinding{false};
 };
 
 }  // namespace saber

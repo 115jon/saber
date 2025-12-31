@@ -2,6 +2,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <boost/asio/detached.hpp>
+#include <boost/asio/error.hpp>
 #include <saber/saber.hpp>
 #include <unordered_set>
 
@@ -148,16 +149,16 @@ Result<ekizu::Permissions> Saber::get_guild_permissions(
 	return ret;
 }
 
-Result<ekizu::VoiceConnectionConfig *> Saber::join_voice_channel(
+Result<ekizu::VoiceConnectionConfig> Saber::join_voice_channel(
 	ekizu::Snowflake guild_id, ekizu::Snowflake channel_id,
 	const boost::asio::yield_context &yield) {
 	m_voice_ready_channels.emplace(guild_id, yield.get_executor());
 
 	auto channel = m_voice_ready_channels[guild_id];
 	SABER_TRY(m_shard.join_voice_channel(guild_id, channel_id, yield));
-	channel->async_receive(yield);
+	auto config = channel->async_receive(yield);
 	m_voice_ready_channels.remove(guild_id);
-	return &m_voice_configs[guild_id];
+	return config;
 }
 
 Result<> Saber::leave_voice_channel(ekizu::Snowflake guild_id,
@@ -367,12 +368,47 @@ void Saber::handle_event(ekizu::Event ev,
 						res.error().message(), ekizu::last_error_context());
 				};
 			},
-			[this](const ekizu::VoiceStateUpdate &v) {
-				if (v.voice_state.guild_id) {
-					m_voice_state_cache[*v.voice_state.guild_id]->put(
+			[this, &yield](const ekizu::VoiceStateUpdate &v) {
+				if (!v.voice_state.guild_id) { return; }
+
+				auto guild_id = *v.voice_state.guild_id;
+				if (!m_voice_state_cache.has(guild_id)) {
+					m_voice_state_cache.put(
+						guild_id,
+						ekizu::SnowflakeLruCache<ekizu::VoiceState>{500});
+				}
+
+				if (v.voice_state.channel_id) {
+					m_voice_state_cache[guild_id]->put(
 						v.voice_state.user_id, v.voice_state);
-					m_voice_configs[*v.voice_state.guild_id].state =
-						v.voice_state;
+				} else {
+					m_voice_state_cache[guild_id]->remove(
+						v.voice_state.user_id);
+				}
+
+				// Only the bot's voice state affects the voice connection
+				// config / player
+				if (v.voice_state.user_id == m_bot_id) {
+					if (v.voice_state.channel_id) {
+						m_voice_configs[guild_id].state = v.voice_state;
+					} else {
+						// Unblock any pending join and discard stale config
+						if (m_voice_ready_channels.has(guild_id)) {
+							m_voice_ready_channels[guild_id]->async_send(
+								boost::asio::error::operation_aborted,
+								ekizu::VoiceConnectionConfig{},
+								[](const boost::system::error_code &) {});
+						}
+						m_voice_configs.erase(guild_id);
+					}
+
+					if (auto res = m_player.on_voice_state_update(
+							guild_id, v.voice_state);
+						!res) {
+						log<ekizu::LogLevel::Error>(
+							"Failed to update player state: {}",
+							res.error().message());
+					}
 				}
 			},
 			[this](const ekizu::VoiceServerUpdate &v) {
@@ -382,8 +418,17 @@ void Saber::handle_event(ekizu::Event ev,
 				if (m_voice_ready_channels.has(v.guild_id)) {
 					m_voice_ready_channels[v.guild_id]->async_send(
 						boost::system::error_code{},
-						&m_voice_configs[v.guild_id],
+						m_voice_configs[v.guild_id],
 						[](const boost::system::error_code &) {});
+				}
+
+				// Rebind transport without resetting playback.
+				if (auto res = m_player.on_voice_server_update(
+						v.guild_id, m_voice_configs[v.guild_id]);
+					!res) {
+					log<ekizu::LogLevel::Error>(
+						"Failed to update player voice server: {}",
+						res.error().message());
 				}
 			},
 			[this](const ekizu::Ready &r) {

@@ -1,9 +1,17 @@
+#include <algorithm>
+#include <array>
 #include <boost/scope_exit.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
 #include <saber/audio_dsp.hpp>
 #include <saber/audio_processor.hpp>
 #include <saber/player_connection.hpp>
 #include <saber/ring_buffer.hpp>
 #include <saber/track.hpp>
+#include <vector>
 
 namespace saber {
 
@@ -18,6 +26,7 @@ AudioProcessor::AudioProcessor() {
 	if (err != OPUS_OK || (m_encoder == nullptr)) {
 		throw std::runtime_error("Failed to create Opus encoder");
 	}
+
 	opus_encoder_ctl(m_encoder, OPUS_SET_BITRATE(128000));
 }
 
@@ -26,22 +35,28 @@ AudioProcessor::~AudioProcessor() {
 }
 
 Result<> AudioProcessor::send_frame(
-	const Frame &pcm_frame, PlayerConnection *conn,
+	const Frame &pcm_frame, const std::shared_ptr<PlayerConnection> &conn,
 	const AudioSettings &settings, std::atomic<float> &limiter_gain,
 	size_t frame_index, size_t fade_frames, float extra_gain,
 	ekizu::Snowflake requester_id, uint64_t track_id,
 	const asio::yield_context &yield) {
+	if (!conn || conn->is_shutdown()) {
+		return boost::system::errc::operation_canceled;
+	}
+
 	// Calculate fade-in factor
 	const float fade_in =
 		(fade_frames > 0 && frame_index < fade_frames)
-			? std::min(static_cast<float>(frame_index + 1) / fade_frames, 1.0F)
+			? std::min(static_cast<float>(frame_index + 1) /
+						   static_cast<float>(fade_frames),
+					   1.0F)
 			: 1.0F;
 
 	const float total_gain = settings.volume * fade_in * extra_gain;
 
 	// Apply gain (use SIMD on x86_64)
 	Frame processed = pcm_frame;
-	auto *samples = reinterpret_cast<int16_t *>(processed.data());
+	auto *samples = processed.data();
 
 #ifdef __x86_64__
 	audio::apply_gain_i16_simd(samples, k_pcm_samples, total_gain);
@@ -62,36 +77,42 @@ Result<> AudioProcessor::send_frame(
 	std::array<uint8_t, 4096> opus_buf{};
 	const int encoded =
 		opus_encode(m_encoder, processed.data(), k_frame_samples,
-					opus_buf.data(), opus_buf.size());
-
+					opus_buf.data(), static_cast<opus_int32>(opus_buf.size()));
 	if (encoded < 0) { return boost::system::errc::operation_not_permitted; }
 
 	// Send to connection
-	TrackData td{std::vector<std::byte>(
-					 reinterpret_cast<std::byte *>(opus_buf.data()),
-					 reinterpret_cast<std::byte *>(opus_buf.data() + encoded)),
-				 false, requester_id, track_id};
+	std::vector<std::byte> payload(static_cast<size_t>(encoded));
+	std::memcpy(payload.data(), opus_buf.data(), static_cast<size_t>(encoded));
 
+	TrackData td{std::move(payload), false, requester_id, track_id};
 	return conn->send_track_data(std::move(td), yield);
 }
 
 Result<> AudioProcessor::process_stream(
-	asio::readable_pipe &rp, PlayerConnection *conn,
+	asio::readable_pipe &rp, std::shared_ptr<PlayerConnection> conn,
 	const AudioSettings &settings, std::atomic<float> &limiter_gain,
 	std::atomic<size_t> &frames_sent, ekizu::Snowflake requester_id,
 	uint64_t track_id, const std::function<bool()> &should_stop,
 	const asio::yield_context &yield) {
+	if (!conn || conn->is_shutdown()) {
+		return boost::system::errc::operation_canceled;
+	}
+
 	const size_t fade_frames = calculate_fade_frames(settings.fade_ms);
 	std::deque<Frame> fade_buffer;
+
 	RingBuffer pcm_buffer(65536);
-
 	auto read_buf = std::make_shared<std::vector<uint8_t>>(8192);
-	Frame pcm_frame;
-	size_t frames_since_check = 0;
 
+	Frame pcm_frame{};
+	size_t frames_since_check = 0;
 	boost::system::error_code ec;
 
 	auto send_with_fade = [&](float extra_gain) -> Result<> {
+		if (!conn || conn->is_shutdown()) {
+			return boost::system::errc::operation_canceled;
+		}
+
 		const size_t idx = frames_sent.load(std::memory_order_relaxed);
 		auto res =
 			send_frame(pcm_frame, conn, settings, limiter_gain, idx,
@@ -149,7 +170,8 @@ Result<> AudioProcessor::process_stream(
 	// Fade-out remaining frames
 	if (fade_frames > 0 && !fade_buffer.empty()) {
 		const size_t remaining = fade_buffer.size();
-		const float step = (remaining > 1) ? 1.0F / (remaining - 1) : 0.0F;
+		const float step =
+			(remaining > 1) ? 1.0F / static_cast<float>(remaining - 1) : 0.0F;
 
 		for (size_t i = 0; i < remaining; ++i) {
 			pcm_frame = fade_buffer.front();
@@ -157,12 +179,17 @@ Result<> AudioProcessor::process_stream(
 
 			const float fade_out =
 				(remaining > 1)
-					? std::clamp((remaining - i - 1) * step, 0.0F, 1.0F)
+					? std::clamp(static_cast<float>(remaining - i - 1) * step,
+								 0.0F, 1.0F)
 					: 0.0F;
 
 			SABER_TRY(send_with_fade(fade_out));
 		}
 	}
+
+	// Clear any remaining partial frame in the buffer
+	// This prevents bleed into the next track
+	if (pcm_buffer.size() > 0) { pcm_buffer.clear(); }
 
 	return outcome::success();
 }
