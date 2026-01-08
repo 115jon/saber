@@ -31,6 +31,7 @@ struct GuildState {
 	PlaybackState playback;
 	std::optional<ekizu::Snowflake> last_voice_channel;
 	AudioSettings audio;
+	AudioProcessor audio_processor;
 
 	std::chrono::steady_clock::duration elapsed() const {
 		if (!playback.running) {

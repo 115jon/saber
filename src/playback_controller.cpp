@@ -56,7 +56,7 @@ Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 		}
 
 		// NEW TRACK: Reset opus encoder to prevent bleed from previous track
-		m_audio_proc.reset_encoder();
+		state.audio_processor.reset_encoder();
 
 		// Resolve stream URL
 		SABER_TRY(auto url, m_stream_mgr.resolve_stream_url(
@@ -91,7 +91,7 @@ Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 
 	// Process audio stream
 	auto should_stop = [conn] { return !conn || conn->is_shutdown(); };
-	auto result = m_audio_proc.process_stream(
+	auto result = state.audio_processor.process_stream(
 		*state.playback.active_stream, std::move(conn), state.audio,
 		state.playback.limiter_gain, state.playback.frames_sent,
 		track.requester_id, track.id, should_stop, yield);

@@ -111,7 +111,6 @@ struct Player {
 
 	// Component managers
 	StreamManager m_stream_mgr;
-	AudioProcessor m_audio_proc;
 	GuildStateManager m_state_mgr;
 	PersistenceManager m_persist_mgr{1};
 	PlaybackController m_playback_ctrl;

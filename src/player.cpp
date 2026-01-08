@@ -13,8 +13,8 @@ static std::mt19937 &rng() {
 Player::Player(asio::any_io_executor ex, Connector connector)
 	: m_connector(std::move(connector)),
 	  m_stream_mgr(ex),
-	  m_playback_ctrl(std::move(ex), m_stream_mgr, m_audio_proc, m_state_mgr,
-					  m_persist_mgr) {}
+	  m_playback_ctrl(std::move(ex), m_stream_mgr, m_state_mgr, m_persist_mgr) {
+}
 
 bool Player::has_connection(ekizu::Snowflake guild_id) const {
 	return m_state_mgr.has_connection(guild_id);

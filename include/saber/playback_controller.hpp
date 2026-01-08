@@ -30,11 +30,10 @@ struct StreamManager;
 
 struct PlaybackController {
 	PlaybackController(asio::any_io_executor ex, StreamManager &stream_mgr,
-					   AudioProcessor &audio_proc, GuildStateManager &state_mgr,
+					   GuildStateManager &state_mgr,
 					   PersistenceManager &persist_mgr)
 		: m_audio_streamer{ex},
 		  m_stream_mgr{stream_mgr},
-		  m_audio_proc{audio_proc},
 		  m_state_mgr{state_mgr},
 		  m_persist_mgr{persist_mgr} {}
 
@@ -88,7 +87,6 @@ struct PlaybackController {
 
 	ytdlpp::media::AudioStreamer m_audio_streamer;
 	StreamManager &m_stream_mgr;
-	AudioProcessor &m_audio_proc;
 	GuildStateManager &m_state_mgr;
 	PersistenceManager &m_persist_mgr;
 };
