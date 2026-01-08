@@ -153,7 +153,7 @@ struct Saber {
 	ekizu::CurrentUser m_user;
 	ekizu::SnowflakeLruCache<ekizu::User> m_user_cache{500};
 	std::unordered_map<ekizu::Snowflake, ekizu::VoiceConnectionConfig>
-		m_voice_configs{500};
+		m_voice_configs;
 	ekizu::SnowflakeLruCache<boost::asio::experimental::channel<void(
 		boost::system::error_code, ekizu::VoiceConnectionConfig)>>
 		m_voice_ready_channels{500};
@@ -173,7 +173,7 @@ struct Saber {
 
 	Player m_player;
 	std::atomic<bool> m_restore_started{false};
-	bool m_running{true};
+	std::atomic<bool> m_running{true};
 };
 }  // namespace saber
 

@@ -10,8 +10,14 @@
 namespace saber {
 
 /**
- * Lock-free ring buffer for single-producer, single-consumer scenarios.
- * Optimized for audio streaming with O(1) read/write operations.
+ * Simple ring buffer for audio streaming.
+ *
+ * NOT thread-safe. This buffer is designed for use within a single coroutine
+ * context where reads and writes occur sequentially. Provides O(1) read/write
+ * operations with minimal overhead.
+ *
+ * @note All access must be serialized by the caller (e.g., within the same
+ *       Boost.Asio strand or coroutine).
  */
 struct RingBuffer {
 	explicit RingBuffer(size_t capacity)

@@ -740,11 +740,15 @@ void Saber::handle_playback_event(const PlaybackEvent &ev,
 							send_followup("There is no next track.");
 						}
 					} else if (data.custom_id == "np_stop") {
-						// auto r = m_player.stop(guild_id);
-						// if (!r) {
-						// 	send_followup(fmt::format(
-						// 		"Stop failed: {}", r.error().message()));
-						// }
+						auto r = m_player.disconnect(guild_id, true);
+						if (!r) {
+							send_followup(fmt::format(
+								"Stop failed: {}", r.error().message()));
+						} else {
+							// Also leave the voice channel
+							boost::system::error_code ec;
+							(void)leave_voice_channel(guild_id, y[ec]);
+						}
 					} else if (data.custom_id == "np_auto_play") {
 						// TODO: Implement autoplay toggle
 						send_followup("AutoPlay is not yet implemented.");
