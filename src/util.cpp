@@ -147,6 +147,37 @@ Result<boost::optional<ekizu::VoiceState &>> in_voice_channel(
 	return outcome::success(voice_state);
 }
 
+Result<boost::optional<ekizu::VoiceState &>> in_voice_channel(
+	Saber &bot, const ekizu::Interaction &interaction,
+	const boost::asio::yield_context &yield) {
+	if (!interaction.guild_id) {
+		return outcome::failure(boost::system::errc::invalid_argument);
+	}
+
+	// Get user ID from interaction (could be from member or user)
+	ekizu::Snowflake user_id{};
+	if (interaction.member) {
+		user_id = interaction.member->user.id;
+	} else if (interaction.user) {
+		user_id = interaction.user->id;
+	} else {
+		return outcome::failure(boost::system::errc::invalid_argument);
+	}
+
+	auto voice_state =
+		bot.voice_states()
+			.get(*interaction.guild_id)
+			.flat_map([&](auto &users) { return users.get(user_id); });
+
+	if (!voice_state.map([](auto &state) { return !!state.channel_id; })
+			 .value_or(false)) {
+		// For interactions, we can't easily reply here since we may have
+		// already deferred. Return error and let the command handle it.
+		return outcome::failure(boost::system::errc::operation_not_permitted);
+	}
+
+	return outcome::success(voice_state);
+}
 std::string truncate(std::string_view s, size_t max_len) {
 	if (s.size() <= max_len) { return std::string{s}; }
 	if (max_len <= 3) { return std::string{s.substr(0, max_len)}; }

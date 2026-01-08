@@ -29,6 +29,10 @@ T get_random_number(T begin = (std::numeric_limits<T>::min)(),
 in_voice_channel(Saber &bot, const ekizu::Message &msg,
 				 const boost::asio::yield_context &yield);
 
+[[nodiscard]] SABER_EXPORT Result<boost::optional<ekizu::VoiceState &>>
+in_voice_channel(Saber &bot, const ekizu::Interaction &interaction,
+				 const boost::asio::yield_context &yield);
+
 constexpr uint16_t k_color_ok = 0x3A7B;
 constexpr uint16_t k_color_warn = 0xB58B;
 constexpr uint16_t k_color_err = 0xB000;

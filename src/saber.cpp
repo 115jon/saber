@@ -857,4 +857,72 @@ void Saber::handle_playback_event(const PlaybackEvent &ev,
 		case PlaybackEventType::TrackFinished: return;
 	}
 }
+
+Result<std::vector<ekizu::ApplicationCommand>> Saber::register_slash_commands(
+	const boost::asio::yield_context &yield) {
+	std::vector<ekizu::ApplicationCommandCreateFields> commands;
+
+	m_commands.get_commands([&](const auto &cmd_map) {
+		for (const auto &[name, cmd] : cmd_map) {
+			if (!cmd || !cmd->options.enabled) { continue; }
+
+			ekizu::ApplicationCommandCreateFields fields;
+			fields.name = cmd->options.name;
+			fields.description = cmd->options.description.empty()
+									 ? "No description"
+									 : cmd->options.description;
+			fields.type = ekizu::ApplicationCommandType::ChatInput;
+
+			// Add options if defined
+			if (cmd->options.slash_options) {
+				fields.options = *cmd->options.slash_options;
+			}
+
+			commands.push_back(std::move(fields));
+		}
+	});
+
+	log<ekizu::LogLevel::Info>(
+		"Registering {} global slash commands", commands.size());
+
+	return m_http
+		.bulk_overwrite_global_application_commands(
+			m_bot_id, std::move(commands))
+		.send(yield);
+}
+
+Result<std::vector<ekizu::ApplicationCommand>>
+Saber::register_guild_slash_commands(ekizu::Snowflake guild_id,
+									 const boost::asio::yield_context &yield) {
+	std::vector<ekizu::ApplicationCommandCreateFields> commands;
+
+	m_commands.get_commands([&](const auto &cmd_map) {
+		for (const auto &[name, cmd] : cmd_map) {
+			if (!cmd || !cmd->options.enabled) { continue; }
+
+			ekizu::ApplicationCommandCreateFields fields;
+			fields.name = cmd->options.name;
+			fields.description = cmd->options.description.empty()
+									 ? "No description"
+									 : cmd->options.description;
+			fields.type = ekizu::ApplicationCommandType::ChatInput;
+
+			// Add options if defined
+			if (cmd->options.slash_options) {
+				fields.options = *cmd->options.slash_options;
+			}
+
+			commands.push_back(std::move(fields));
+		}
+	});
+
+	log<ekizu::LogLevel::Info>("Registering {} guild slash commands for {}",
+							   commands.size(), guild_id);
+
+	return m_http
+		.bulk_overwrite_guild_application_commands(
+			m_bot_id, guild_id, std::move(commands))
+		.send(yield);
+}
+
 }  // namespace saber

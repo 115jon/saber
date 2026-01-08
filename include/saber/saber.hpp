@@ -111,6 +111,18 @@ struct Saber {
 	[[nodiscard]] SABER_EXPORT Result<> stop(
 		const boost::asio::yield_context &yield);
 
+	/// Register all loaded commands as Discord slash commands (global).
+	/// Should be called once after commands are loaded.
+	[[nodiscard]] SABER_EXPORT Result<std::vector<ekizu::ApplicationCommand>>
+	register_slash_commands(const boost::asio::yield_context &yield);
+
+	/// Register all loaded commands as Discord slash commands for a specific
+	/// guild. Useful for testing (guild commands update instantly, global can
+	/// take up to 1 hour).
+	[[nodiscard]] SABER_EXPORT Result<std::vector<ekizu::ApplicationCommand>>
+	register_guild_slash_commands(ekizu::Snowflake guild_id,
+								  const boost::asio::yield_context &yield);
+
 	template <ekizu::LogLevel level, typename... Args>
 	void log(Args &&...args) {
 		switch (level) {
