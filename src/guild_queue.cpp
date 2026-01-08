@@ -15,7 +15,9 @@ Track GuildQueue::add_track(Track track) {
 
 	log<ekizu::LogLevel::Info>(
 		"Added track: {} (ID: {})",
-		track.title.empty() ? track.webpage_url : track.title, track.id);
+		track.metadata.title.empty() ? track.metadata.webpage_url
+									 : track.metadata.title,
+		track.id);
 	return track;
 }
 

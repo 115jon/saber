@@ -1,105 +1,136 @@
-# syntax=docker/dockerfile:1.7-labs
+# =============================================================================
+# Saber Discord Bot - Production Docker Build (uses vcpkg registry)
+# =============================================================================
+# Build: docker buildx build -t saber --load .
+# Run:   docker run --env-file .env --rm saber
+# =============================================================================
 
-FROM ubuntu:20.04 AS build
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG ALPINE_VERSION=3.23
+ARG VCPKG_BASE=jon115/alpine-vcpkg:2025.10.17
+
+# =============================================================================
+# Stage 1: Base image with build tools
+# =============================================================================
+FROM ${VCPKG_BASE} AS base
+
+# Install additional build dependencies
+RUN apk add --no-cache \
+        autoconf automake bash file libtool \
+        meson nasm re2c wget xz && \
+    git config --global http.version HTTP/1.1
+
+# =============================================================================
+# Stage 2: Install vcpkg dependencies (cached layer)
+# =============================================================================
+FROM base AS deps
 
 WORKDIR /app
-ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
 
-# vcpkg location (so CMake/tooling can find it consistently)
-ENV CC=/usr/bin/gcc
-ENV CXX=/usr/bin/g++
-ENV VCPKG_ROOT=/opt/vcpkg
-ENV PATH=${PATH}:${VCPKG_ROOT}
+# Copy manifest and triplet files
+COPY vcpkg.json vcpkg-configuration.json ./
+COPY vcpkg-triplets/ /vcpkg-triplets/
+COPY overlay-ports/ /overlay-ports/
 
-RUN <<'EOF'
-set -euxo pipefail
-apt-get update
-apt-get install -y --no-install-recommends \
-  autoconf automake build-essential cmake git libtool ninja-build \
-  ca-certificates curl zip unzip tar pkg-config \
-  wget xz-utils file
-rm -rf /var/lib/apt/lists/*
-EOF
+ENV VCPKG_INSTALLED_DIR=/app/vcpkg_installed
 
-RUN <<'EOF'
-set -euxo pipefail
-if [ ! -d "${VCPKG_ROOT}" ]; then
-  git clone --depth=1 https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
-fi
-cd "${VCPKG_ROOT}"
-./bootstrap-vcpkg.sh
-EOF
+# Install vcpkg dependencies with architecture-specific cache mounts
+RUN --mount=type=cache,target=/vcpkg/downloads,id=vcpkg-dl-${TARGETARCH} \
+    --mount=type=cache,target=/vcpkg/buildtrees,id=vcpkg-bt-${TARGETARCH} \
+    --mount=type=cache,target=/vcpkg/packages,id=vcpkg-pkg-${TARGETARCH} \
+    --mount=type=cache,target=/root/.cache/vcpkg,id=vcpkg-rc-${TARGETARCH} \
+    rm -rf /vcpkg/downloads/tools && \
+    case "${TARGETARCH}" in \
+      amd64) TRIPLET="x64-linux-dynamic-release" ;; \
+      arm64) TRIPLET="arm64-linux-dynamic-release" ;; \
+      *) echo "Unsupported: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${TRIPLET}" > .vcpkg-triplet && \
+    vcpkg install \
+        --overlay-ports=/overlay-ports \
+        --overlay-triplets=/vcpkg-triplets \
+        --triplet="${TRIPLET}" \
+        --x-no-default-features \
+        --x-feature=boost \
+        --x-feature=ffmpeg \
+        --x-feature=openssl
 
-RUN --mount=type=bind,source=commands,target=commands \
-    --mount=type=bind,source=include,target=include \
-    --mount=type=bind,source=extern,target=extern \
-    --mount=type=bind,source=src,target=src \
-    --mount=type=bind,source=CMakeLists.txt,target=CMakeLists.txt \
-    --mount=type=bind,source=vcpkg-configuration.json,target=vcpkg-configuration.json \
-    --mount=type=bind,source=vcpkg.json,target=vcpkg.json \
-    <<'EOF'
-set -euxo pipefail
+# =============================================================================
+# Stage 3: Build the application
+# =============================================================================
+FROM base AS build
 
-cmake -S. -Bbuild -DCMAKE_BUILD_TYPE=Release -GNinja \
-  -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
+WORKDIR /app
 
-# Optional: strip to reduce size of copied artifacts
-strip -s build/bin/* 2>/dev/null || true
-strip -s build/lib/* 2>/dev/null || true
+# Copy cached vcpkg dependencies
+COPY --from=deps /app/vcpkg_installed/ build/vcpkg_installed/
+COPY --from=deps /app/.vcpkg-triplet .
 
-mkdir -p /saber
-cp -a build/bin/* /saber/ 2>/dev/null || true
-cp -a build/lib/* /saber/ 2>/dev/null || true
+# Copy project files
+COPY vcpkg-triplets/ /vcpkg-triplets/
+COPY overlay-ports/ /overlay-ports/
+COPY vcpkg.json vcpkg-configuration.json CMakeLists.txt ./
+COPY commands/ commands/
+COPY include/ include/
+COPY src/ src/
 
-touch /saber/saber.log
-chmod 666 /saber/saber.log
-EOF
+# Configure and build (deps already installed, disable manifest install)
+RUN TRIPLET="$(cat .vcpkg-triplet)" && \
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
+        -DCMAKE_C_COMPILER=/usr/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+        -DCMAKE_BUILD_TYPE=MinSizeRel \
+        -DCMAKE_TOOLCHAIN_FILE=/vcpkg/scripts/buildsystems/vcpkg.cmake \
+        -DVCPKG_TARGET_TRIPLET="${TRIPLET}" \
+        -DVCPKG_OVERLAY_PORTS=/overlay-ports \
+        -DVCPKG_OVERLAY_TRIPLETS=/vcpkg-triplets \
+        -DVCPKG_MANIFEST_INSTALL=OFF \
+        -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON \
+        -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+        -DCMAKE_INSTALL_RPATH='$ORIGIN' && \
+    cmake --build build --config MinSizeRel -j 12
 
-RUN <<'EOF'
-set -euxo pipefail
-ARCH="$(uname -m)"
-if [ "$ARCH" = "x86_64" ]; then ARCH='amd64'; fi
-if [ "$ARCH" = "aarch64" ]; then ARCH='arm64'; fi
+# Copy shared libraries alongside binaries
+RUN TRIPLET="$(cat .vcpkg-triplet)" && \
+    find "build/vcpkg_installed/${TRIPLET}/lib" -name "*.so*" \
+        -exec cp -P {} build/bin/ \; 2>/dev/null || true
 
-wget -q "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-${ARCH}-static.tar.xz" -O /tmp/ffmpeg.tar.xz
-mkdir -p /tmp/ffmpeg
-tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg
+# =============================================================================
+# Stage 4: Strip binaries for minimal size
+# =============================================================================
+FROM alpine:${ALPINE_VERSION} AS strip
 
-install -m 0755 "$(find /tmp/ffmpeg -type f -name ffmpeg  | head -n1)" /saber/ffmpeg
-install -m 0755 "$(find /tmp/ffmpeg -type f -name ffprobe | head -n1)" /saber/ffprobe
+WORKDIR /out
+COPY --from=build /app/build/bin/ ./
 
-if [ "$ARCH" = "amd64" ]; then
-  wget -q 'https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux' -O /saber/yt-dlp
-else
-  wget -q "https://github.com/yt-dlp/yt-dlp/releases/download/2025.12.08/yt-dlp_linux_${ARCH}" -O /saber/yt-dlp
-fi
-chmod 0755 /saber/yt-dlp
+RUN apk add --no-cache binutils && \
+    find . -type f \( -executable -o -name "*.so*" \) \
+        -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
+    find . -name "*.a" -delete 2>/dev/null || true && \
+    touch saber.log && chmod 666 saber.log
 
-rm -rf /tmp/*
-EOF
+# =============================================================================
+# Stage 5: Final minimal runtime image
+# =============================================================================
+FROM alpine:${ALPINE_VERSION} AS runtime
 
-FROM debian:bookworm-slim AS runtime
-ARG DEBIAN_FRONTEND=noninteractive
+LABEL org.opencontainers.image.title="Saber" \
+      org.opencontainers.image.description="Discord music bot" \
+      org.opencontainers.image.source="https://github.com/115jon/saber"
 
-RUN <<'EOF'
-set -eux
-apt-get update
-apt-get install -y --no-install-recommends \
-  ca-certificates \
-  libstdc++6 \
-  libgcc-s1
-rm -rf /var/lib/apt/lists/*
-EOF
+# Runtime dependencies only
+RUN apk add --no-cache ca-certificates libgcc libstdc++ && \
+    addgroup -g 65532 -S saber && \
+    adduser -u 65532 -S -G saber -H saber
 
 WORKDIR /saber
-COPY --from=build /saber/ /saber/
+COPY --from=strip --chown=saber:saber /out/ ./
 
-ENV PATH=/saber:${PATH}
-# Ensure your own shared libs in /saber are discoverable (safe now that we are not vendoring glibc libs).
-ENV LD_LIBRARY_PATH=/saber
-ENV SSL_CERT_DIR=/etc/ssl/certs
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+USER saber
 
-CMD ["./saber"]
+ENV PATH="/saber:${PATH}" \
+    LD_LIBRARY_PATH="/saber" \
+    TMPDIR="/tmp"
+
+ENTRYPOINT ["/saber/saber"]

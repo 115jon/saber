@@ -1,26 +1,78 @@
 {
+  "name": "saber",
+  "version": "0.1.0",
+  "description": "Saber Discord bot",
   "dependencies": [
-    "boost-asio",
-    "boost-beast",
-    "boost-charconv",
-    "boost-coroutine2",
-    "boost-filesystem",
-    "boost-process",
-    "boost-scope-exit",
-    "boost-outcome",
-    "boost-url",
-    "fmt",
     {
-      "name": "libdave",
-      "features": ["disable-logging"]
+      "name": "ekizu",
+      "default-features": false
     },
-    "libsodium",
-    "nlohmann-json",
-    "openssl",
-    "opus",
+    {
+      "name": "ytdlpp",
+      "default-features": false
+    },
     "opusfile",
-    "portaudio",
-    "spdlog",
-    "zlib"
+    "spdlog"
+  ],
+  "features": {
+    "boost": {
+      "description": "Build Boost via vcpkg (skip with --x-no-default-features for system Boost)",
+      "dependencies": [
+        "boost-coroutine",
+        "boost-process",
+        "boost-program-options",
+        "boost-scope-exit",
+        {
+          "name": "ekizu",
+          "default-features": false,
+          "features": [
+            "boost"
+          ]
+        },
+        {
+          "name": "ytdlpp",
+          "default-features": false,
+          "features": [
+            "boost"
+          ]
+        }
+      ]
+    },
+    "openssl": {
+      "description": "Build OpenSSL via vcpkg (skip with --x-no-default-features for system OpenSSL)",
+      "dependencies": [
+        {
+          "name": "ekizu",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        },
+        {
+          "name": "ytdlpp",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        }
+      ]
+    },
+    "ffmpeg": {
+      "description": "Build FFmpeg via vcpkg (skip with --x-no-default-features for system FFmpeg)",
+      "dependencies": [
+        {
+          "name": "ytdlpp",
+          "default-features": false,
+          "features": [
+            "ffmpeg"
+          ]
+        }
+      ]
+    }
+  },
+  "default-features": [
+    "boost",
+    "openssl",
+    "ffmpeg"
   ]
 }

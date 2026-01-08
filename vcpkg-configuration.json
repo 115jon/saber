@@ -1,17 +1,27 @@
 {
   "default-registry": {
-    "baseline": "d5ec528843d29e3a52d745a64b469f810b2cedbf",
     "kind": "git",
+    "baseline": "d5ec528843d29e3a52d745a64b469f810b2cedbf",
     "repository": "https://github.com/microsoft/vcpkg"
   },
-  "overlay-ports": [
-    "./extern/ekizu/overlay-ports"
-  ],
   "registries": [
     {
       "kind": "artifact",
       "location": "https://github.com/microsoft/vcpkg-ce-catalog/archive/refs/heads/main.zip",
       "name": "microsoft"
+    },
+    {
+      "kind": "git",
+      "repository": "https://github.com/115jon/vcpkg-registry",
+      "baseline": "7acc562e6f3c5342b91e2fc672e4803ca87d4fa0",
+      "packages": [
+        "certify",
+        "ekizu",
+        "libdave",
+        "mlspp",
+        "quickjs-ng",
+        "ytdlpp"
+      ]
     }
   ]
 }

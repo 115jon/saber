@@ -164,7 +164,7 @@ std::optional<size_t> find_index_by_id(const std::deque<Track> &tracks,
 
 std::string format_track_line(const Track &track, bool is_current) {
 	// Keep it short-ish to avoid embed limits.
-	const auto title = truncate(track.title, 96);
+	const auto title = truncate(track.metadata.title, 96);
 
 	if (is_current) { return fmt::format("**`{}`** `{}`", track.id, title); }
 	return fmt::format("`{}` `{}`", track.id, title);
@@ -202,6 +202,17 @@ ekizu::Embed music_action_embed(
 size_t page_count(size_t item_count, size_t page_size) {
 	if (page_size == 0) { return 1; }
 	return std::max<size_t>(1, (item_count + page_size - 1) / page_size);
+}
+
+std::string format_duration(uint64_t duration) {
+	const auto hours = duration / 3600;
+	const auto minutes = (duration % 3600) / 60;
+	const auto seconds = duration % 60;
+
+	if (hours > 0) {
+		return fmt::format("{}:{:02}:{:02}", hours, minutes, seconds);
+	}
+	return fmt::format("{:02}:{:02}", minutes, seconds);
 }
 
 }  // namespace saber::util

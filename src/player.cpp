@@ -10,7 +10,11 @@ static std::mt19937 &rng() {
 	return rng;
 }
 
-Player::Player(Connector connector) : m_connector(std::move(connector)) {}
+Player::Player(asio::any_io_executor ex, Connector connector)
+	: m_connector(std::move(connector)),
+	  m_stream_mgr(ex),
+	  m_playback_ctrl(std::move(ex), m_stream_mgr, m_audio_proc, m_state_mgr,
+					  m_persist_mgr) {}
 
 bool Player::has_connection(ekizu::Snowflake guild_id) const {
 	return m_state_mgr.has_connection(guild_id);
@@ -160,14 +164,14 @@ Result<Track> Player::play(ekizu::Snowflake guild_id, std::string_view query,
 
 	SABER_TRY(auto meta, m_stream_mgr.resolve_metadata(query, yield));
 
-	auto track = state->queue->add_track(
-		{0,
-		 requester_id,
-		 std::move(meta.webpage_url),
-		 std::move(meta.title),
-		 {}});
+	auto track = state->queue->add_track({0, requester_id, std::move(meta)});
 
-	log<ekizu::LogLevel::Info>("Enqueued track {} ({})", track.id, track.title);
+	log<ekizu::LogLevel::Info>(
+		"Enqueued track {} ({})", track.id, track.metadata.title);
+
+	if (m_on_event) {
+		m_on_event({PlaybackEventType::TrackEnqueued, guild_id, track, {}});
+	}
 
 	ensure_playback(guild_id, state, yield);
 	m_playback_ctrl.mark_persist_dirty(guild_id);
@@ -263,7 +267,6 @@ Result<bool> Player::clear(ekizu::Snowflake guild_id) {
 								   [id = *q->current_track_id](const auto &t) {
 									   return t.id == id;
 								   });
-
 			if (it == tracks.end()) { return false; }
 			start_it = std::next(it);
 		}
@@ -273,6 +276,14 @@ Result<bool> Player::clear(ekizu::Snowflake guild_id) {
 		tracks.erase(start_it, tracks.end());
 		return true;
 	});
+}
+
+Result<bool> Player::is_paused(ekizu::Snowflake guild_id) {
+	auto *state = m_state_mgr.get(guild_id);
+	if ((state == nullptr) || !state->connection) {
+		return boost::system::errc::no_such_file_or_directory;
+	}
+	return state->playback.paused;
 }
 
 Result<> Player::pause(ekizu::Snowflake guild_id) {

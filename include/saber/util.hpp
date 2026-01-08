@@ -55,6 +55,8 @@ constexpr uint16_t k_color_err = 0xB000;
 [[nodiscard]] SABER_EXPORT size_t page_count(size_t item_count,
 											 size_t page_size);
 
+[[nodiscard]] SABER_EXPORT std::string format_duration(uint64_t duration);
+
 }  // namespace saber::util
 
 #endif	// SABER_UTIL_HPP

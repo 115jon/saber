@@ -32,18 +32,17 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/bin") # .exe and
                                                                    # .dll
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/lib") # .so and
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/bin") # .so and
                                                                    # .dylib
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/lib") # .lib and .a
 
-add_subdirectory(extern/ekizu)
-
-find_package(Boost REQUIRED COMPONENTS coroutine2 process scope_exit url)
+find_package(ekizu CONFIG REQUIRED)
+find_package(ytdlpp CONFIG REQUIRED)
+find_package(Boost REQUIRED COMPONENTS coroutine process scope_exit url)
 find_package(OpusFile CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(portaudio REQUIRED)
 
-set(portaudio_target "")
 if(TARGET portaudio)
     set(portaudio_target portaudio)
 elseif(TARGET portaudio_static)
@@ -80,7 +79,8 @@ target_include_directories(
 
 target_link_libraries(
     saber_lib
-    PUBLIC ekizu spdlog::spdlog ${portaudio_target} Boost::coroutine2
+    PUBLIC ekizu::ekizu spdlog::spdlog ${portaudio_target} Boost::coroutine
+           ytdlpp::yt-dlpp-lib
     PRIVATE OpusFile::opusfile Boost::process Boost::scope_exit Boost::url
 )
 

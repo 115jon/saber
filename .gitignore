@@ -1,3 +1,23 @@
+# =============================================================================
+# Saber Project-Specific Ignores
+# =============================================================================
+
+# Local development dependencies (symlinks/junctions to local repos)
+extern/
+
+# Development-only configuration files
+vcpkg-configuration.dev.json
+Dockerfile.dev
+
+# vcpkg installed packages (managed by vcpkg, not committed)
+vcpkg_installed/
+
+# State persistence directory
+state/
+
+# =============================================================================
+# Build Directories
+# =============================================================================
 [Bb]uild/*
 [Dd]ocs/*
 CMakeCache.*

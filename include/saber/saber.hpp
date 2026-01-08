@@ -9,6 +9,7 @@
 #include <ekizu/http_client.hpp>
 #include <ekizu/lru_cache.hpp>
 #include <ekizu/shard.hpp>
+#include <optional>
 #include <saber/commands.hpp>
 #include <saber/component_collector.hpp>
 #include <saber/config.hpp>
@@ -65,6 +66,11 @@ struct Saber {
 
 	[[nodiscard]] std::string_view prefix() const noexcept {
 		return config().prefix;
+	}
+
+	void set_now_playing_channel(ekizu::Snowflake guild_id,
+								 ekizu::Snowflake channel_id) noexcept {
+		m_now_playing_channels[guild_id] = channel_id;
 	}
 
 	[[nodiscard]] SABER_EXPORT Result<boost::optional<ekizu::Guild &>>
@@ -124,7 +130,14 @@ struct Saber {
 	}
 
    private:
+	struct NowPlayingMessage {
+		ekizu::Snowflake channel_id{};
+		ekizu::Snowflake message_id{};
+	};
+
 	void handle_event(ekizu::Event ev, const boost::asio::yield_context &yield);
+	void handle_playback_event(const PlaybackEvent &ev,
+							   const boost::asio::yield_context &yield);
 
 	ekizu::Snowflake m_bot_id;
 	CommandLoader m_commands;
@@ -150,6 +163,14 @@ struct Saber {
 	boost::unordered_flat_map<ekizu::Snowflake,
 							  std::vector<std::shared_ptr<ComponentCollector>>>
 		m_collectors;
+	boost::unordered_flat_map<ekizu::Snowflake,
+							  std::shared_ptr<ComponentCollector>>
+		m_now_playing_collectors;
+	boost::unordered_flat_map<ekizu::Snowflake, ekizu::Snowflake>
+		m_now_playing_channels;
+	boost::unordered_flat_map<ekizu::Snowflake, ekizu::Message>
+		m_now_playing_messages;
+
 	Player m_player;
 	std::atomic<bool> m_restore_started{false};
 	bool m_running{true};

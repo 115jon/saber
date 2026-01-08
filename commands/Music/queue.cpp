@@ -45,7 +45,7 @@ std::string render_queue_page(const std::deque<Track> &tracks,
 	for (size_t i = start; i < end; ++i) {
 		const auto &t = tracks[i];
 		const bool is_now = current_id && (t.id == *current_id);
-		const auto title = util::truncate(t.title, 90);
+		const auto title = util::truncate(t.metadata.title, 90);
 
 		if (is_now) {
 			fmt::format_to(

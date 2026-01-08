@@ -76,10 +76,7 @@ std::string PersistenceManager::to_json(const GuildPersistData &data) {
 		for (size_t count = 0; it != data.queue.tracks.end() &&
 							   count < GuildPersistData::k_max_persisted_tracks;
 			 ++it, ++count) {
-			qj["tracks"].push_back({{"id", it->id},
-									{"requester_id", it->requester_id},
-									{"webpage_url", it->webpage_url},
-									{"title", it->title}});
+			qj["tracks"].push_back(nlohmann::json(*it));
 		}
 	}
 
@@ -123,13 +120,7 @@ std::optional<GuildPersistData> PersistenceManager::from_json(
 
 			if (qj.contains("tracks") && qj["tracks"].is_array()) {
 				for (const auto &tj : qj["tracks"]) {
-					data.queue.tracks.push_back(
-						{tj.value("id", 0ULL),
-
-						 tj["requester_id"].get<ekizu::Snowflake>(),
-						 tj.value("webpage_url", std::string{}),
-						 tj.value("title", std::string{}),
-						 {}});
+					data.queue.tracks.push_back(tj);
 				}
 			}
 		}

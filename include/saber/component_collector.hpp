@@ -69,6 +69,10 @@ class InteractionCollector {
 	explicit InteractionCollector(std::shared_ptr<ComponentCollector> collector)
 		: m_collector(std::move(collector)) {}
 
+	[[nodiscard]] std::shared_ptr<ComponentCollector> get_internal() const {
+		return m_collector;
+	}
+
 	// The key fix: Returns the specific type T, not a variant.
 	Result<std::pair<ekizu::Interaction, T>> async_receive(
 		const boost::asio::yield_context &yield) {

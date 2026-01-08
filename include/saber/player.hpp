@@ -18,7 +18,7 @@ struct Player {
 	using Connector = std::function<Result<ekizu::VoiceConnectionConfig>(
 		ekizu::Snowflake, ekizu::Snowflake, const asio::yield_context &)>;
 
-	explicit Player(Connector connector);
+	explicit Player(asio::any_io_executor ex, Connector connector);
 
 	// Connection management
 	SABER_EXPORT Result<bool> connect(ekizu::Snowflake guild_id,
@@ -56,6 +56,7 @@ struct Player {
 	SABER_EXPORT Result<bool> shuffle(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<bool> clear(ekizu::Snowflake guild_id);
 
+	SABER_EXPORT Result<bool> is_paused(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<> pause(ekizu::Snowflake guild_id);
 	SABER_EXPORT Result<> resume(ekizu::Snowflake guild_id);
 
@@ -83,6 +84,13 @@ struct Player {
 	// Queue access
 	SABER_EXPORT Result<GuildQueue *> queue(ekizu::Snowflake guild_id);
 
+	// Playback events (single listener; intended for Saber)
+	void attach_playback_event_handler(
+		std::function<void(const PlaybackEvent &)> handler) {
+		m_on_event = handler;
+		m_playback_ctrl.attach_event_handler(std::move(handler));
+	}
+
 	// Persistence
 	Result<> restore_all(const asio::yield_context &yield);
 
@@ -92,25 +100,21 @@ struct Player {
 	// Logging
 	void attach_logger(std::function<void(ekizu::Log)> logger) {
 		m_logger = logger;
+		m_state_mgr.attach_logger(logger);
 		m_playback_ctrl.attach_logger(std::move(logger));
 	}
 
    private:
 	Connector m_connector;
 	std::function<void(ekizu::Log)> m_logger;
+	std::function<void(const PlaybackEvent &)> m_on_event;
 
 	// Component managers
 	StreamManager m_stream_mgr;
 	AudioProcessor m_audio_proc;
-
-	GuildStateManager m_state_mgr{[this](ekizu::Log l) {
-		if (m_logger) { m_logger(std::move(l)); }
-	}};
-
+	GuildStateManager m_state_mgr;
 	PersistenceManager m_persist_mgr{1};
-
-	PlaybackController m_playback_ctrl{
-		m_stream_mgr, m_audio_proc, m_state_mgr, m_persist_mgr};
+	PlaybackController m_playback_ctrl;
 
 	void ensure_playback(ekizu::Snowflake guild_id, GuildState *state,
 						 const asio::yield_context &yield) {

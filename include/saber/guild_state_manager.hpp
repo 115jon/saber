@@ -7,7 +7,7 @@
 #include <optional>
 #include <saber/audio_processor.hpp>
 #include <saber/player_connection.hpp>
-#include <saber/stream_manager.hpp>
+#include <ytdlpp/audio_streamer.hpp>
 
 namespace saber {
 struct GuildQueue;
@@ -20,7 +20,7 @@ struct PlaybackState {
 	std::chrono::steady_clock::time_point track_started;
 	std::atomic<size_t> frames_sent{0};
 	std::atomic<float> limiter_gain{1.0F};
-	std::shared_ptr<StreamResources> active_stream;
+	std::optional<ytdlpp::media::AudioStream> active_stream;
 	std::optional<uint64_t> active_stream_track_id;
 };
 
@@ -53,9 +53,6 @@ struct GuildState {
 };
 
 struct GuildStateManager {
-	explicit GuildStateManager(std::function<void(ekizu::Log)> logger)
-		: m_logger(std::move(logger)) {}
-
 	// Get or create guild state
 	GuildState *get_or_create(ekizu::Snowflake guild_id);
 
@@ -75,6 +72,10 @@ struct GuildStateManager {
 
 	// Get all guild IDs
 	[[nodiscard]] std::vector<ekizu::Snowflake> all_guilds() const;
+
+	void attach_logger(std::function<void(ekizu::Log)> on_log) {
+		m_logger = std::move(on_log);
+	}
 
    private:
 	std::map<ekizu::Snowflake, std::unique_ptr<GuildState>> m_states;

@@ -1,20 +1,39 @@
 #ifndef SABER_PLAYBACK_CONTROLLER_HPP
 #define SABER_PLAYBACK_CONTROLLER_HPP
 
+#include <boost/system/error_code.hpp>
+#include <functional>
+#include <optional>
 #include <saber/guild_state_manager.hpp>
 #include <saber/persistence_manager.hpp>
 #include <utility>
 
 namespace saber {
 
+enum class PlaybackEventType : uint8_t {
+	TrackEnqueued,
+	TrackStarted,
+	TrackFinished,
+	TrackError,
+	QueueEnded
+};
+
+struct PlaybackEvent {
+	PlaybackEventType type{};
+	ekizu::Snowflake guild_id{};
+	std::optional<Track> track;
+	boost::system::error_code error;
+};
+
 struct AudioProcessor;
 struct StreamManager;
 
 struct PlaybackController {
-	PlaybackController(StreamManager &stream_mgr, AudioProcessor &audio_proc,
-					   GuildStateManager &state_mgr,
+	PlaybackController(asio::any_io_executor ex, StreamManager &stream_mgr,
+					   AudioProcessor &audio_proc, GuildStateManager &state_mgr,
 					   PersistenceManager &persist_mgr)
-		: m_stream_mgr{stream_mgr},
+		: m_audio_streamer{ex},
+		  m_stream_mgr{stream_mgr},
 		  m_audio_proc{audio_proc},
 		  m_state_mgr{state_mgr},
 		  m_persist_mgr{persist_mgr} {}
@@ -36,7 +55,17 @@ struct PlaybackController {
 		m_on_log = std::move(on_log);
 	}
 
+	void attach_event_handler(
+		std::function<void(const PlaybackEvent &)> on_event) {
+		m_on_event = std::move(on_event);
+	}
+
    private:
+	void emit_event(PlaybackEvent ev) const {
+		if (!m_on_event) { return; }
+		m_on_event(ev);
+	}
+
 	template <ekizu::LogLevel level, typename... Args>
 	void log(fmt::format_string<Args...> fmtstr, Args &&...args) const {
 		if (!m_on_log) { return; }
@@ -50,12 +79,14 @@ struct PlaybackController {
 	}
 
 	std::function<void(ekizu::Log)> m_on_log;
+	std::function<void(const PlaybackEvent &)> m_on_event;
 
 	// Track the last successfully played track ID to preserve position across
 	// transport interruptions (channel moves, brief disconnects).
 	std::unordered_map<ekizu::Snowflake, std::optional<uint64_t>>
 		m_last_played_track;
 
+	ytdlpp::media::AudioStreamer m_audio_streamer;
 	StreamManager &m_stream_mgr;
 	AudioProcessor &m_audio_proc;
 	GuildStateManager &m_state_mgr;

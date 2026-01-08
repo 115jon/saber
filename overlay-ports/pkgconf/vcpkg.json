@@ -1,0 +1,7 @@
+{
+  "name": "pkgconf",
+  "version": "2.3.0",
+  "port-version": 100,
+  "description": "System pkgconf passthrough - uses system-installed pkgconf",
+  "license": "ISC"
+}

@@ -29,7 +29,7 @@ void PlaybackController::mark_persist_dirty(ekizu::Snowflake guild_id) {
 
 Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 										const asio::yield_context &yield) {
-	if (track.webpage_url.empty()) {
+	if (track.metadata.webpage_url.empty()) {
 		return boost::system::errc::invalid_argument;
 	}
 
@@ -49,7 +49,8 @@ Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 			log<ekizu::LogLevel::Info>(
 				"Clearing old stream (was track {}, now track {})",
 				state.playback.active_stream_track_id.value_or(0), track.id);
-			// Just reset the shared_ptr - cancel() was already called
+			// Cancel and reset the stream
+			state.playback.active_stream->cancel();
 			state.playback.active_stream.reset();
 			state.playback.active_stream_track_id.reset();
 		}
@@ -58,16 +59,30 @@ Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 		m_audio_proc.reset_encoder();
 
 		// Resolve stream URL
-		SABER_TRY(auto url,
-				  m_stream_mgr.resolve_stream_url(track.webpage_url, yield));
+		SABER_TRY(auto url, m_stream_mgr.resolve_stream_url(
+								track.metadata.webpage_url, yield));
 
 		log<ekizu::LogLevel::Info>(
-			"Starting ffmpeg for track {} (frames_sent={})", track.id,
+			"Resolved URL for track {}: {}", track.id, url);
+
+		log<ekizu::LogLevel::Info>(
+			"Opening audio stream for track {} (frames_sent={})", track.id,
 			state.playback.frames_sent.load());
 
-		// Start ffmpeg
-		SABER_TRY(auto resources, m_stream_mgr.start_ffmpeg_stream(url, yield));
-		state.playback.active_stream = resources;
+		// Open audio stream using AudioStreamer
+		ytdlpp::media::AudioStreamOptions opts{};
+		opts.sample_rate = 48000;
+		opts.channels = 2;
+		opts.sample_fmt = ytdlpp::media::SampleFormat::S16;
+
+		auto stream_result = m_audio_streamer.async_open(url, opts, yield);
+		if (!stream_result) {
+			log<ekizu::LogLevel::Error>("Failed to open audio stream: {}",
+										stream_result.error().message());
+			return stream_result.assume_error();
+		}
+
+		state.playback.active_stream.emplace(std::move(stream_result.value()));
 		state.playback.active_stream_track_id = track.id;
 	}
 
@@ -77,7 +92,7 @@ Result<> PlaybackController::play_track(GuildState &state, const Track &track,
 	// Process audio stream
 	auto should_stop = [conn] { return !conn || conn->is_shutdown(); };
 	auto result = m_audio_proc.process_stream(
-		state.playback.active_stream->rp(), std::move(conn), state.audio,
+		*state.playback.active_stream, std::move(conn), state.audio,
 		state.playback.limiter_gain, state.playback.frames_sent,
 		track.requester_id, track.id, should_stop, yield);
 
@@ -113,7 +128,13 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 		auto queue = state->queue;
 
 		if (!conn || !queue) { break; }
-		if (conn->is_shutdown() || !queue->current_track_id) { break; }
+		if (conn->is_shutdown()) { break; }
+
+		if (!queue->current_track_id) {
+			emit_event(
+				{PlaybackEventType::QueueEnded, guild_id, std::nullopt, {}});
+			break;
+		}
 
 		auto it = std::find_if(queue->tracks.begin(), queue->tracks.end(),
 							   [id = *queue->current_track_id](const Track &t) {
@@ -123,6 +144,8 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 		if (it == queue->tracks.end()) {
 			queue->current_track_id.reset();
 			mark_persist_dirty(guild_id);
+			emit_event(
+				{PlaybackEventType::QueueEnded, guild_id, std::nullopt, {}});
 			break;
 		}
 
@@ -153,6 +176,8 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 
 			log<ekizu::LogLevel::Debug>(
 				"Starting track {} (new/reset)", track_id);
+
+			emit_event({PlaybackEventType::TrackStarted, guild_id, *it, {}});
 		}
 
 		// Send initial track data if paused
@@ -187,6 +212,9 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 				continue;
 			}
 
+			emit_event(
+				{PlaybackEventType::TrackError, guild_id, *it, res.error()});
+
 			// Skip to next on error
 			if (queue->current_track_id &&
 				*queue->current_track_id == track_id) {
@@ -197,6 +225,8 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 				mark_persist_dirty(guild_id);
 				continue;
 			}
+		} else {
+			emit_event({PlaybackEventType::TrackFinished, guild_id, *it, {}});
 		}
 
 		// Natural progression to next track
@@ -210,7 +240,11 @@ Result<> PlaybackController::start_loop(ekizu::Snowflake guild_id,
 										  : std::nullopt;
 		mark_persist_dirty(guild_id);
 
-		if (!queue->current_track_id) { break; }
+		if (!queue->current_track_id) {
+			emit_event(
+				{PlaybackEventType::QueueEnded, guild_id, std::nullopt, {}});
+			break;
+		}
 	}
 
 	// Cleanup (at the end of start_loop)

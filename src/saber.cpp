@@ -1,9 +1,11 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <boost/algorithm/string.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/error.hpp>
 #include <saber/saber.hpp>
+#include <saber/util.hpp>
 #include <unordered_set>
 
 namespace {
@@ -52,10 +54,11 @@ Saber::Saber(boost::asio::io_context &ctx, Config config)
 	  m_shard{ctx.get_executor(), ekizu::ShardId::ONE, config.token,
 			  ekizu::Intents::AllIntents},
 	  m_config{std::move(config)},
-	  m_player{[this](ekizu::Snowflake guild_id, ekizu::Snowflake channel_id,
+	  m_player{ctx.get_executor(),
+			   [this](ekizu::Snowflake guild_id, ekizu::Snowflake channel_id,
 					  const boost::asio::yield_context &yield) {
-		  return join_voice_channel(guild_id, channel_id, yield);
-	  }} {
+				   return join_voice_channel(guild_id, channel_id, yield);
+			   }} {
 	auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
 	console_sink->set_pattern("%^%Y-%m-%d %H:%M:%S.%e [%L] [th#%t]%$ : %v");
 
@@ -219,6 +222,14 @@ Saber::create_modal_submit_collector(
 void Saber::run(const boost::asio::yield_context &yield) {
 	m_commands.load_all(yield);
 
+	// Playback -> "Now Playing" message bridge (single listener).
+	m_player.attach_playback_event_handler(
+		[this, ex = yield.get_executor()](const PlaybackEvent &ev) {
+			boost::asio::spawn(
+				ex, [this, ev](const auto &y) { handle_playback_event(ev, y); },
+				boost::asio::detached);
+		});
+
 	boost::system::error_code ec;
 	while (m_running) {
 		auto res = m_shard.next_event(yield[ec]);
@@ -241,7 +252,6 @@ void Saber::run(const boost::asio::yield_context &yield) {
 			m_shard.get_executor(),
 			[this, ev = std::move(res.value())](const auto &y) {
 				handle_event(ev, y);
-
 				bool expected = false;
 				if (m_restore_started.compare_exchange_strong(expected, true)) {
 					boost::asio::spawn(
@@ -368,7 +378,7 @@ void Saber::handle_event(ekizu::Event ev,
 						res.error().message(), ekizu::last_error_context());
 				};
 			},
-			[this, &yield](const ekizu::VoiceStateUpdate &v) {
+			[this](const ekizu::VoiceStateUpdate &v) {
 				if (!v.voice_state.guild_id) { return; }
 
 				auto guild_id = *v.voice_state.guild_id;
@@ -456,5 +466,391 @@ void Saber::handle_event(ekizu::Event ev,
 				// 	"Unhandled event: {}", nlohmann::json{e}.dump());
 			}},
 		ev);
+}
+
+void Saber::handle_playback_event(const PlaybackEvent &ev,
+								  const boost::asio::yield_context &yield) {
+	const auto guild_id = ev.guild_id;
+
+	auto is_paused_fn = [this, guild_id] {
+		auto res = m_player.is_paused(guild_id);
+		return res && res.value();
+	};
+
+	auto chan_it = m_now_playing_channels.find(guild_id);
+	if (chan_it == m_now_playing_channels.end()) { return; }
+	const auto channel_id = chan_it->second;
+
+	auto create_components_v2 =
+		[&](std::string header_text, std::string body_text,
+			std::optional<std::string> image_url, const Track *track)
+		-> std::pair<ekizu::MessageFlags,
+					 std::vector<ekizu::MessageComponent>> {
+		const bool is_paused = is_paused_fn();
+
+		// Header line (usually contains a markdown link)
+		ekizu::TextDisplay header;
+		header.content = std::move(header_text);
+
+		ekizu::TextDisplay body;
+		ekizu::TextDisplay meta;
+
+		std::optional<ekizu::Snowflake> voice_channel_id;
+		if (auto vc = m_player.voice_channel_id(guild_id); vc) {
+			voice_channel_id = vc.value();
+		}
+
+		if (track) {
+			const auto &md = track->metadata;
+			const auto url = md.webpage_url.empty() ? std::string{"about:blank"}
+													: md.webpage_url;
+			body.content = fmt::format(
+				"### [{}]({}) - `{}`",
+				md.title.empty() ? std::string{"(unknown)"} : md.title, url,
+				util::format_duration(md.duration_seconds));
+
+			if (voice_channel_id) {
+				meta.content =
+					fmt::format("> Requested by <@{}>\n> Connected in <#{}>",
+								track->requester_id, *voice_channel_id);
+			} else {
+				meta.content =
+					fmt::format("> Requested by <@{}>", track->requester_id);
+			}
+		} else {
+			body.content = std::move(body_text);
+		}
+
+		ekizu::Section section;
+		if (track) {
+			if (!body_text.empty()) {
+				ekizu::TextDisplay extra;
+				extra.content = std::move(body_text);
+				section.components = {header, body, extra, meta};
+			} else {
+				section.components = {header, body, meta};
+			}
+		} else {
+			section.components = {header, body};
+		}
+
+		// Add media accessory if we have album art
+		if (image_url && !image_url->empty()) {
+			ekizu::Thumbnail media;
+			media.media.url = *image_url;
+			section.accessory = media;
+		}
+
+		// Create control buttons
+		auto play_button =
+			ekizu::ButtonBuilder()
+				.custom_id("np_pause")
+				.style(is_paused ? ekizu::ButtonStyle::Success
+								 : ekizu::ButtonStyle::Secondary)
+				.label(is_paused ? "Resume" : "Pause")
+				.emoji(is_paused
+						   ? ekizu::EmojiBuilder()
+								 .id(ekizu::Snowflake{1051612861769711706ULL})
+								 .name("play")
+								 .build()
+						   : ekizu::EmojiBuilder().name("⏸️").build())
+				.build();
+
+		auto skip_button =
+			ekizu::ButtonBuilder()
+				.custom_id("np_skip")
+				.style(ekizu::ButtonStyle::Secondary)
+				.label("Skip")
+				.emoji(ekizu::EmojiBuilder()
+						   .id(ekizu::Snowflake{1051614199769469008ULL})
+						   .name("skip_next")
+						   .build())
+				.build();
+
+		auto stop_button =
+			ekizu::ButtonBuilder()
+				.custom_id("np_stop")
+				.style(ekizu::ButtonStyle::Secondary)
+				.label("Stop")
+				.emoji(ekizu::EmojiBuilder()
+						   .id(ekizu::Snowflake{1051615255605805127ULL})
+						   .name("stop")
+						   .build())
+				.build();
+
+		auto autoplay_button =
+			ekizu::ButtonBuilder()
+				.custom_id("np_auto_play")
+				.style(ekizu::ButtonStyle::Secondary)
+				.label("AutoPlay")
+				.emoji(ekizu::EmojiBuilder()
+						   .id(ekizu::Snowflake{1323515075839004742ULL})
+						   .name("autoplay")
+						   .build())
+				.build();
+
+		auto like_button =
+			ekizu::ButtonBuilder()
+				.custom_id(track ? fmt::format("np_like={}",
+											   track->metadata.webpage_url)
+								 : "np_like=")
+				.style(ekizu::ButtonStyle::Secondary)
+				.label("Like")
+				.emoji(ekizu::EmojiBuilder().name("🤍").build())
+				.build();
+
+		ekizu::Container container;
+		container.accent_color = 0x947CEA;
+		container.spoiler = false;
+		container.components = {section};
+
+		auto button_row =
+			ekizu::ActionRowBuilder()
+				.components({play_button, skip_button, stop_button,
+							 autoplay_button, like_button})
+				.build();
+
+		return {ekizu::MessageFlags::IsComponentsV2,
+				std::vector<ekizu::MessageComponent>{container, button_row}};
+	};
+
+	auto start_collector = [&](ekizu::Snowflake msg_id) {
+		// Stop existing collector if any
+		if (m_now_playing_collectors.contains(guild_id)) {
+			m_now_playing_collectors[guild_id]->shutdown();
+		}
+
+		auto filter = [msg_id](const ekizu::Interaction &interaction,
+							   const ekizu::MessageComponentData &data) {
+			if (!interaction.message) { return false; }
+			if (interaction.message->id != msg_id) { return false; }
+
+			return data.custom_id == "np_pause" ||
+				   data.custom_id == "np_skip" || data.custom_id == "np_stop" ||
+				   data.custom_id == "np_auto_play" ||
+				   boost::starts_with(data.custom_id, "np_like=");
+		};
+
+		auto collector = create_message_component_collector(
+			channel_id, filter, {ekizu::ComponentType::Button},
+			std::chrono::hours(24), yield);	 // Long timeout
+
+		m_now_playing_collectors[guild_id] = collector.get_internal();
+
+		// Spawn collector loop
+		boost::asio::spawn(
+			yield.get_executor(),
+			[this, guild_id, channel_id, collector = std::move(collector),
+			 is_paused_fn](const auto &y) mutable {
+				auto ack_interaction = [&](const ekizu::Interaction &i) {
+					boost::system::error_code ec;
+					(void)m_http.interaction(i.application_id)
+						.create_response(
+							i.id, i.token,
+							ekizu::InteractionResponseBuilder()
+								.type(ekizu::InteractionResponseType::
+										  DeferredUpdateMessage)
+								.build())
+						.send(y[ec]);
+				};
+
+				auto send_followup = [&](std::string content) {
+					boost::system::error_code ec;
+					(void)m_http.create_message(channel_id)
+						.content(std::move(content))
+						.send(y[ec]);
+				};
+
+				bool is_paused = is_paused_fn();
+
+				auto update_buttons = [this, &guild_id, &y, &is_paused]() {
+					auto msg_it = m_now_playing_messages.find(guild_id);
+					if (msg_it == m_now_playing_messages.end()) { return; }
+
+					auto &msg = msg_it->second;
+
+					// Find the button row and update the pause button
+					for (auto &top : msg.components) {
+						auto *row = std::get_if<ekizu::ActionRow>(&top);
+						if (!row) { continue; }
+
+						for (auto &comp : row->components) {
+							auto *btn = std::get_if<ekizu::Button>(&comp);
+							if (!btn || btn->custom_id != "np_pause") {
+								continue;
+							}
+
+							btn->label = is_paused ? "Resume" : "Pause";
+							btn->style =
+								is_paused ? ekizu::ButtonStyle::Success
+										  : ekizu::ButtonStyle::Secondary;
+							btn->emoji =
+								is_paused
+									? ekizu::EmojiBuilder()
+										  .id(ekizu::Snowflake{
+											  1051612861769711706ULL})
+										  .name("play")
+										  .build()
+									: ekizu::EmojiBuilder().name("⏸️").build();
+						}
+					}
+
+					(void)m_http
+						.edit_message(
+							msg_it->second.channel_id, msg_it->second.id)
+						.flags(ekizu::MessageFlags::IsComponentsV2)
+						.components(msg.components)
+						.send(y);
+				};
+
+				while (true) {
+					auto res = collector.async_receive(y);
+					if (!res) { break; }
+
+					auto &[i, data] = res.value();
+					ack_interaction(i);
+
+					if (data.custom_id == "np_pause") {
+						is_paused = is_paused_fn();
+						if (is_paused) {
+							auto r = m_player.resume(guild_id);
+							if (!r) {
+								send_followup(fmt::format(
+									"Resume failed: {}", r.error().message()));
+							} else {
+								is_paused = is_paused_fn();
+								update_buttons();
+							}
+						} else {
+							auto r = m_player.pause(guild_id);
+							if (!r) {
+								send_followup(fmt::format(
+									"Pause failed: {}", r.error().message()));
+							} else {
+								is_paused = is_paused_fn();
+								update_buttons();
+							}
+						}
+					} else if (data.custom_id == "np_skip") {
+						auto r = m_player.skip(guild_id);
+						if (!r) {
+							send_followup(fmt::format(
+								"Skip failed: {}", r.error().message()));
+						} else if (!r.value()) {
+							send_followup("There is no next track.");
+						}
+					} else if (data.custom_id == "np_stop") {
+						// auto r = m_player.stop(guild_id);
+						// if (!r) {
+						// 	send_followup(fmt::format(
+						// 		"Stop failed: {}", r.error().message()));
+						// }
+					} else if (data.custom_id == "np_auto_play") {
+						// TODO: Implement autoplay toggle
+						send_followup("AutoPlay is not yet implemented.");
+					} else if (boost::starts_with(data.custom_id, "np_like=")) {
+						// TODO: Implement like/save track
+						send_followup("Like feature is not yet implemented.");
+					}
+				}
+
+				// Cleanup collector from map when done
+				m_now_playing_collectors.erase(guild_id);
+			},
+			boost::asio::detached);
+	};
+
+	auto upsert_now_playing = [&](std::string header, std::string body,
+								  std::optional<std::string> image,
+								  const Track *track) {
+		auto msg_it = m_now_playing_messages.find(guild_id);
+
+		auto [flags, components] = create_components_v2(
+			std::move(header), std::move(body), std::move(image), track);
+
+		if (msg_it != m_now_playing_messages.end() &&
+			msg_it->second.channel_id == channel_id) {
+			auto edit_res = m_http.edit_message(channel_id, msg_it->second.id)
+								.flags(flags)
+								.components(components)
+								.send(yield);
+			if (edit_res) {
+				// Restart collector for existing message
+				start_collector(msg_it->second.id);
+				return;
+			}
+		}
+
+		auto create_res =
+			m_http.create_message(channel_id)
+				.flags(flags)
+				.components(components)
+				.send(yield);
+
+		if (!create_res) {
+			log<ekizu::LogLevel::Warn>(
+				"Now playing create_message failed: {{error={}, context={}}}",
+				create_res.error().message(), ekizu::last_error_context());
+			return;
+		}
+
+		m_now_playing_messages[guild_id] = create_res.value();
+
+		// Start collector for new message
+		start_collector(create_res.value().id);
+	};
+
+	auto edit_now_playing_if_exists = [&](std::string header,
+										  std::string body) {
+		auto msg_it = m_now_playing_messages.find(guild_id);
+		if (msg_it == m_now_playing_messages.end()) { return; }
+
+		auto [flags, components] = create_components_v2(
+			std::move(header), std::move(body), std::nullopt, nullptr);
+
+		(void)m_http.edit_message(msg_it->second.channel_id, msg_it->second.id)
+			.flags(flags)
+			.components(components)
+			.send(yield);
+	};
+
+	switch (ev.type) {
+		case PlaybackEventType::TrackStarted: {
+			if (!ev.track) { return; }
+			const auto &t = *ev.track;
+
+			upsert_now_playing("**Now playing**", "",
+							   t.metadata.thumbnail_url.empty()
+								   ? std::nullopt
+								   : std::optional{t.metadata.thumbnail_url},
+							   &t);
+			return;
+		}
+		case PlaybackEventType::TrackError: {
+			if (!ev.track) { return; }
+			const auto &t = *ev.track;
+
+			upsert_now_playing(
+				"**⚠️ Track error**", fmt::format("`{}`", ev.error.message()),
+				t.metadata.thumbnail_url.empty()
+					? std::nullopt
+					: std::optional{t.metadata.thumbnail_url},
+				&t);
+			return;
+		}
+		case PlaybackEventType::QueueEnded: {
+			edit_now_playing_if_exists(
+				"**⏹️ Queue finished**", "Add more with `/play`.");
+
+			// Stop collector when queue ends
+			if (m_now_playing_collectors.contains(guild_id)) {
+				m_now_playing_collectors[guild_id]->shutdown();
+				m_now_playing_collectors.erase(guild_id);
+			}
+			return;
+		}
+		case PlaybackEventType::TrackEnqueued:
+		case PlaybackEventType::TrackFinished: return;
+	}
 }
 }  // namespace saber

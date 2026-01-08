@@ -1,5 +1,4 @@
 #include <saber/guild_state_manager.hpp>
-#include <saber/stream_manager.hpp>
 
 namespace saber {
 

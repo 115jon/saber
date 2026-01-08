@@ -89,7 +89,7 @@ Result<> AudioProcessor::send_frame(
 }
 
 Result<> AudioProcessor::process_stream(
-	asio::readable_pipe &rp, std::shared_ptr<PlayerConnection> conn,
+	ytdlpp::media::AudioStream &stream, std::shared_ptr<PlayerConnection> conn,
 	const AudioSettings &settings, std::atomic<float> &limiter_gain,
 	std::atomic<size_t> &frames_sent, ekizu::Snowflake requester_id,
 	uint64_t track_id, const std::function<bool()> &should_stop,
@@ -106,7 +106,6 @@ Result<> AudioProcessor::process_stream(
 
 	Frame pcm_frame{};
 	size_t frames_since_check = 0;
-	boost::system::error_code ec;
 
 	auto send_with_fade = [&](float extra_gain) -> Result<> {
 		if (!conn || conn->is_shutdown()) {
@@ -124,7 +123,7 @@ Result<> AudioProcessor::process_stream(
 	};
 
 	// Main processing loop
-	while (true) {
+	while (!stream.is_eof() && !stream.is_cancelled()) {
 		// Check for shutdown periodically
 		if (++frames_since_check >= k_shutdown_check_interval) {
 			frames_since_check = 0;
@@ -133,20 +132,21 @@ Result<> AudioProcessor::process_stream(
 			}
 		}
 
-		// Read from pipe
+		// Read from AudioStream
 		read_buf->resize(8192);
-		const size_t n = rp.async_read_some(asio::buffer(*read_buf), yield[ec]);
+		auto read_result = stream.async_read(asio::buffer(*read_buf), yield);
 
-		if (ec == asio::error::operation_aborted ||
-			ec == asio::error::bad_descriptor || !rp.is_open()) {
-			return boost::system::errc::operation_canceled;
+		if (!read_result) {
+			// Check for cancellation
+			if (stream.is_cancelled()) {
+				return boost::system::errc::operation_canceled;
+			}
+			// Other errors - propagate
+			return read_result.assume_error();
 		}
 
-		if (ec && ec != asio::error::eof && ec != asio::error::broken_pipe) {
-			return ec;
-		}
-
-		if (n == 0 || ec) { break; }
+		const size_t n = read_result.value();
+		if (n == 0) { break; }	// EOF
 
 		pcm_buffer.write(read_buf->data(), n);
 

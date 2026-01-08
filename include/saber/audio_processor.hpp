@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <saber/result.hpp>
+#include <ytdlpp/audio_streamer.hpp>
 
 namespace saber {
 
@@ -80,10 +81,11 @@ struct AudioProcessor {
 
 	// Process PCM stream from pipe and send encoded frames
 	Result<> process_stream(
-		asio::readable_pipe &rp, std::shared_ptr<PlayerConnection> conn,
-		const AudioSettings &settings, std::atomic<float> &limiter_gain,
-		std::atomic<size_t> &frames_sent, ekizu::Snowflake requester_id,
-		uint64_t track_id, const std::function<bool()> &should_stop,
+		ytdlpp::media::AudioStream &stream,
+		std::shared_ptr<PlayerConnection> conn, const AudioSettings &settings,
+		std::atomic<float> &limiter_gain, std::atomic<size_t> &frames_sent,
+		ekizu::Snowflake requester_id, uint64_t track_id,
+		const std::function<bool()> &should_stop,
 		const asio::yield_context &yield);
 
 	// Reset encoder state between tracks to prevent audio artifacts
