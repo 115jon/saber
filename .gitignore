@@ -7,6 +7,7 @@ extern/
 
 # Development-only configuration files
 vcpkg-configuration.dev.json
+vcpkg-configuration.json.bak
 Dockerfile.dev
 
 # vcpkg installed packages (managed by vcpkg, not committed)
