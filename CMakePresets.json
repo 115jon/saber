@@ -10,7 +10,7 @@
       "name": "base",
       "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/${presetName}",
+      "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
@@ -28,23 +28,14 @@
     },
     {
       "name": "dev",
-      "displayName": "Development (Local Dependencies)",
-      "description": "Uses overlay-ports from extern/{ekizu,ytdlpp}/overlay-ports for local development. Requires junctions in extern/ pointing to local repos.",
+      "displayName": "Development (add_subdirectory)",
+      "description": "Uses add_subdirectory for ekizu/ytdlpp - true incremental builds. Requires junctions in extern/.",
       "inherits": "vcpkg-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "SABER_DEV_MODE": "ON",
         "VCPKG_OVERLAY_PORTS": "${sourceDir}/extern/ekizu/overlay-ports;${sourceDir}/extern/ytdlpp/overlay-ports"
-      }
-    },
-    {
-      "name": "release",
-      "displayName": "Release (vcpkg Registry)",
-      "description": "Uses vcpkg registry for production dependencies",
-      "inherits": "vcpkg-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
     {
@@ -55,6 +46,17 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (vcpkg Registry)",
+      "description": "Uses vcpkg registry for production dependencies",
+      "inherits": "vcpkg-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "SABER_DEV_MODE": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -63,12 +65,12 @@
       "configurePreset": "dev"
     },
     {
-      "name": "release",
-      "configurePreset": "release"
-    },
-    {
       "name": "dev-relwithdebinfo",
       "configurePreset": "dev-relwithdebinfo"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
     }
   ]
 }

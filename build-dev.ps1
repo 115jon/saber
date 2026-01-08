@@ -4,10 +4,14 @@
 
 .DESCRIPTION
     This script:
-    1. Swaps vcpkg-configuration.json with the dev version (for overlay-ports)
-    2. Runs cmake configure with the 'dev' preset
+    1. Swaps vcpkg-configuration.json with the dev version (for inner dependencies)
+    2. Runs cmake configure with SABER_DEV_MODE=ON (uses add_subdirectory)
     3. Builds the project
     4. Restores the original vcpkg-configuration.json
+
+    Using add_subdirectory instead of vcpkg overlay-ports means:
+    - Incremental builds: only changed files in ekizu/ytdlpp are recompiled
+    - No full package rebuild when you change one line
 
 .PARAMETER BuildType
     CMake build type: Debug (default), RelWithDebInfo, or Release
@@ -15,17 +19,22 @@
 .PARAMETER Clean
     Clean the build directory before configuring
 
+.PARAMETER Configure
+    Only configure, don't build
+
 .EXAMPLE
     .\build-dev.ps1
     .\build-dev.ps1 -BuildType RelWithDebInfo
     .\build-dev.ps1 -Clean
+    .\build-dev.ps1 -Configure  # Only configure, useful for IDE integration
 #>
 
 param(
     [ValidateSet("Debug", "RelWithDebInfo", "Release")]
     [string]$BuildType = "Debug",
 
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Configure
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,18 +56,24 @@ if (-not (Test-Path $VcpkgConfigDev)) {
 $ExternEkizu = Join-Path $ProjectRoot "extern/ekizu"
 $ExternYtdlpp = Join-Path $ProjectRoot "extern/ytdlpp"
 
-if (-not (Test-Path $ExternEkizu)) {
-    Write-Warning "extern/ekizu not found. Create a junction with:"
-    Write-Host "  cmd /c mklink /J `"$ExternEkizu`" `"<path-to-ekizu-repo>`""
+if (-not (Test-Path "$ExternEkizu/CMakeLists.txt")) {
+    Write-Error @"
+extern/ekizu not found or is not a valid repo. Create a junction with:
+  cmd /c mklink /J "$ExternEkizu" "<path-to-ekizu-repo>"
+"@
+    exit 1
 }
 
-if (-not (Test-Path $ExternYtdlpp)) {
-    Write-Warning "extern/ytdlpp not found. Create a junction with:"
-    Write-Host "  cmd /c mklink /J `"$ExternYtdlpp`" `"<path-to-ytdlpp-repo>`""
+if (-not (Test-Path "$ExternYtdlpp/CMakeLists.txt")) {
+    Write-Error @"
+extern/ytdlpp not found or is not a valid repo. Create a junction with:
+  cmd /c mklink /J "$ExternYtdlpp" "<path-to-ytdlpp-repo>"
+"@
+    exit 1
 }
 
 try {
-    # Backup and swap vcpkg config
+    # Backup and swap vcpkg config (needed for inner dependencies like libdave, mlspp)
     Write-Host "Swapping to dev vcpkg configuration..." -ForegroundColor Cyan
     if (Test-Path $VcpkgConfig) {
         Copy-Item $VcpkgConfig $VcpkgConfigBackup -Force
@@ -71,8 +86,19 @@ try {
         Remove-Item -Recurse -Force $BuildDir
     }
 
-    # Configure
-    Write-Host "Configuring with CMake (BuildType: $BuildType)..." -ForegroundColor Cyan
+    # Determine vcpkg toolchain location
+    $VcpkgToolchain = $null
+    if ($env:VCPKG_ROOT) {
+        $VcpkgToolchain = "$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+    } elseif (Test-Path "C:/Users/$env:USERNAME/scoop/apps/vcpkg/current/scripts/buildsystems/vcpkg.cmake") {
+        $VcpkgToolchain = "C:/Users/$env:USERNAME/scoop/apps/vcpkg/current/scripts/buildsystems/vcpkg.cmake"
+    } else {
+        Write-Error "VCPKG_ROOT not set and vcpkg not found in scoop. Please set VCPKG_ROOT."
+        exit 1
+    }
+
+    # Configure with SABER_DEV_MODE
+    Write-Host "Configuring with CMake (BuildType: $BuildType, DEV_MODE: ON)..." -ForegroundColor Cyan
     $ConfigArgs = @(
         "-S", $ProjectRoot,
         "-B", $BuildDir,
@@ -80,28 +106,23 @@ try {
         "-DCMAKE_BUILD_TYPE=$BuildType",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         "-DVCPKG_TARGET_TRIPLET=x64-windows",
-        "-DVCPKG_OVERLAY_PORTS=$ExternEkizu/overlay-ports;$ExternYtdlpp/overlay-ports"
+        "-DSABER_DEV_MODE=ON",
+        "-DVCPKG_OVERLAY_PORTS=$ExternEkizu/overlay-ports;$ExternYtdlpp/overlay-ports",
+        "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
     )
-
-    # Add toolchain file if VCPKG_ROOT is set
-    if ($env:VCPKG_ROOT) {
-        $ConfigArgs += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-    } elseif (Test-Path "C:/Users/$env:USERNAME/scoop/apps/vcpkg/current/scripts/buildsystems/vcpkg.cmake") {
-        $ConfigArgs += "-DCMAKE_TOOLCHAIN_FILE=C:/Users/$env:USERNAME/scoop/apps/vcpkg/current/scripts/buildsystems/vcpkg.cmake"
-    } else {
-        Write-Error "VCPKG_ROOT not set and vcpkg not found in scoop. Please set VCPKG_ROOT."
-        exit 1
-    }
 
     cmake @ConfigArgs
     if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
-    # Build
-    Write-Host "Building..." -ForegroundColor Cyan
-    cmake --build $BuildDir --config $BuildType
-    if ($LASTEXITCODE -ne 0) { throw "CMake build failed" }
-
-    Write-Host "Build complete!" -ForegroundColor Green
+    if (-not $Configure) {
+        # Build
+        Write-Host "Building..." -ForegroundColor Cyan
+        cmake --build $BuildDir --config $BuildType
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed" }
+        Write-Host "Build complete!" -ForegroundColor Green
+    } else {
+        Write-Host "Configure complete! (skipped build due to -Configure flag)" -ForegroundColor Green
+    }
 }
 finally {
     # Always restore original config
@@ -110,3 +131,12 @@ finally {
         Move-Item $VcpkgConfigBackup $VcpkgConfig -Force
     }
 }
+
+Write-Host @"
+
+Next steps:
+  - Incremental build: cmake --build build
+  - Run the bot:       .\build\bin\saber.exe
+  - Clean rebuild:     .\build-dev.ps1 -Clean
+
+"@ -ForegroundColor DarkGray

@@ -18,6 +18,9 @@ if(UNIX)
 endif()
 
 option(saber_INSTALL "Generate the install target" ON)
+option(SABER_DEV_MODE
+       "Use add_subdirectory for ekizu/ytdlpp (faster incremental builds)" OFF
+)
 
 set(BUILD_SHARED_LIBS
     ON
@@ -36,8 +39,61 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/bin") # .so and
                                                                    # .dylib
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "$<0:>${CMAKE_BINARY_DIR}/lib") # .lib and .a
 
-find_package(ekizu CONFIG REQUIRED)
-find_package(ytdlpp CONFIG REQUIRED)
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+if(SABER_DEV_MODE)
+    # Development mode: use add_subdirectory for fast incremental builds The
+    # overlay-ports from ekizu/ytdlpp provide their inner dependencies
+    message(
+        STATUS
+            "SABER_DEV_MODE enabled - using add_subdirectory for ekizu/ytdlpp"
+    )
+
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/extern/ekizu/CMakeLists.txt")
+        message(
+            FATAL_ERROR
+                "extern/ekizu not found. Create a junction:\n"
+                "  cmd /c mklink /J \"${PROJECT_SOURCE_DIR}/extern/ekizu\" \"<path-to-ekizu-repo>\""
+        )
+    endif()
+
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/extern/ytdlpp/CMakeLists.txt")
+        message(
+            FATAL_ERROR
+                "extern/ytdlpp not found. Create a junction:\n"
+                "  cmd /c mklink /J \"${PROJECT_SOURCE_DIR}/extern/ytdlpp\" \"<path-to-ytdlpp-repo>\""
+        )
+    endif()
+
+    # Add ekizu and ytdlpp as subdirectories Force them to use vcpkg
+    # dependencies since we are in a vcpkg build environment
+    set(YTDLPP_USE_SYSTEM_BOOST
+        OFF
+        CACHE BOOL "Force vcpkg boost" FORCE
+    )
+    set(YTDLPP_USE_SYSTEM_FFMPEG
+        OFF
+        CACHE BOOL "Force vcpkg ffmpeg" FORCE
+    )
+
+    add_subdirectory(extern/ekizu)
+    add_subdirectory(extern/ytdlpp)
+
+    # Create aliases to match find_package names
+    if(NOT TARGET ekizu::ekizu)
+        add_library(ekizu::ekizu ALIAS ekizu)
+    endif()
+    if(NOT TARGET ytdlpp::yt-dlpp-lib)
+        add_library(ytdlpp::yt-dlpp-lib ALIAS yt-dlpp-lib)
+    endif()
+else()
+    # Production mode: use vcpkg packages
+    find_package(ekizu CONFIG REQUIRED)
+    find_package(ytdlpp CONFIG REQUIRED)
+endif()
+
 find_package(Boost REQUIRED COMPONENTS coroutine process scope_exit url)
 find_package(OpusFile CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
