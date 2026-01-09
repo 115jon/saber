@@ -24,7 +24,7 @@ struct Saber {
 
 	[[nodiscard]] CommandLoader &commands() noexcept { return m_commands; }
 
-	[[nodiscard]] boost::unordered_flat_map<ekizu::Snowflake, CommandCooldown> &
+	[[nodiscard]] ekizu::SnowflakeLruCache<CommandCooldown> &
 	command_cooldowns() noexcept {
 		return m_command_cooldowns;
 	}
@@ -153,8 +153,7 @@ struct Saber {
 
 	ekizu::Snowflake m_bot_id;
 	CommandLoader m_commands;
-	boost::unordered_flat_map<ekizu::Snowflake, CommandCooldown>
-		m_command_cooldowns;
+	ekizu::SnowflakeLruCache<CommandCooldown> m_command_cooldowns{10000};
 	ekizu::HttpClient m_http;
 	std::optional<spdlog::logger> m_logger;
 	ekizu::SnowflakeLruCache<ekizu::Guild> m_guild_cache{500};

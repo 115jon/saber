@@ -153,19 +153,19 @@ static GateCheckResult check_common_gates(Saber &bot, Command &cmd,
 	}
 
 	// Cooldown gate - owner bypasses cooldowns
-	if (!is_owner && bot.command_cooldowns().contains(inv.user_id)) {
-		auto &cooldown = bot.command_cooldowns().at(inv.user_id);
+	if (!is_owner) {
+		if (auto user_cooldowns = bot.command_cooldowns().get(inv.user_id)) {
+			if (user_cooldowns->contains(command_name)) {
+				auto expiry = user_cooldowns->at(command_name);
+				auto delta = std::chrono::floor<std::chrono::seconds>(
+								 expiry - std::chrono::steady_clock::now())
+								 .count();
 
-		if (cooldown.contains(command_name)) {
-			auto expiry = cooldown.at(command_name);
-			auto delta = std::chrono::floor<std::chrono::seconds>(
-							 expiry - std::chrono::steady_clock::now())
-							 .count();
-
-			if (delta > 0) {
-				result.result = GateResult::Cooldown;
-				result.cooldown_remaining = delta;
-				return result;
+				if (delta > 0) {
+					result.result = GateResult::Cooldown;
+					result.cooldown_remaining = delta;
+					return result;
+				}
 			}
 		}
 	}
@@ -176,8 +176,17 @@ static GateCheckResult check_common_gates(Saber &bot, Command &cmd,
 static void update_cooldown(Saber &bot, const CommandInvocation &inv,
 							const std::string &command_name,
 							std::chrono::steady_clock::duration cooldown) {
-	bot.command_cooldowns()[inv.user_id][command_name] =
-		std::chrono::steady_clock::now() + cooldown;
+	// Get or create user cooldown entry
+	auto user_cooldowns = bot.command_cooldowns().get(inv.user_id);
+	if (!user_cooldowns) {
+		bot.command_cooldowns().put(inv.user_id, CommandCooldown{});
+		user_cooldowns = bot.command_cooldowns().get(inv.user_id);
+	}
+
+	if (user_cooldowns) {
+		(*user_cooldowns)[command_name] =
+			std::chrono::steady_clock::now() + cooldown;
+	}
 }
 
 // ---------------------------------------------------------------------------

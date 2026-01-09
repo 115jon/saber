@@ -64,7 +64,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build rpm \
             libssl-dev zlib1g-dev linux-libc-dev \
-            libtool autoconf pkg-config \
+            libtool autoconf pkg-config nasm \
             ${{ matrix.compiler }}
 
       - name: Install dependencies (vcpkg)

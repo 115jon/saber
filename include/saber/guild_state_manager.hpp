@@ -7,6 +7,7 @@
 #include <optional>
 #include <saber/audio_processor.hpp>
 #include <saber/player_connection.hpp>
+#include <shared_mutex>
 #include <ytdlpp/audio_streamer.hpp>
 
 namespace saber {
@@ -54,31 +55,33 @@ struct GuildState {
 };
 
 struct GuildStateManager {
-	// Get or create guild state
+	// Get or create guild state (thread-safe)
 	GuildState *get_or_create(ekizu::Snowflake guild_id);
 
-	// Get existing state (returns nullptr if not found)
+	// Get existing state (returns nullptr if not found, thread-safe)
 	GuildState *get(ekizu::Snowflake guild_id);
 	[[nodiscard]] const GuildState *get(ekizu::Snowflake guild_id) const;
 
-	// Check existence
+	// Check existence (thread-safe)
 	[[nodiscard]] bool has_connection(ekizu::Snowflake guild_id) const;
 	[[nodiscard]] bool has_queue(ekizu::Snowflake guild_id) const;
 
-	// Remove state
+	// Remove state (thread-safe)
 	void remove(ekizu::Snowflake guild_id);
 
-	// Clear all states
+	// Clear all states (thread-safe)
 	void clear();
 
-	// Get all guild IDs
+	// Get all guild IDs (thread-safe)
 	[[nodiscard]] std::vector<ekizu::Snowflake> all_guilds() const;
 
 	void attach_logger(std::function<void(ekizu::Log)> on_log) {
+		std::unique_lock lock{m_mtx};
 		m_logger = std::move(on_log);
 	}
 
    private:
+	mutable std::shared_mutex m_mtx;
 	std::map<ekizu::Snowflake, std::unique_ptr<GuildState>> m_states;
 	std::function<void(ekizu::Log)> m_logger;
 };
