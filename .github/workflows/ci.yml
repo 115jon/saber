@@ -48,12 +48,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           submodules: recursive
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -92,7 +92,7 @@ jobs:
         run: mv build/bin/saber build/bin/${{ env.OUTPUT_NAME }}
 
       - name: Upload Binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: ${{ env.OUTPUT_NAME }}
           path: build/bin/${{ env.OUTPUT_NAME }}
@@ -115,19 +115,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           submodules: recursive
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2.0.0
 
       - name: Install dependencies (vcpkg)
         uses: johnwason/vcpkg-action@v7
@@ -153,7 +153,7 @@ jobs:
         run: Move-Item build/bin/${{ matrix.config }}/saber.exe build/bin/${{ env.OUTPUT_NAME }}
 
       - name: Upload Binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: ${{ env.OUTPUT_NAME }}
           path: build/bin/${{ env.OUTPUT_NAME }}
@@ -166,19 +166,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           submodules: recursive
 
       - name: Get Next Version
         id: semver
-        uses: ietf-tools/semver-action@v1
+        uses: ietf-tools/semver-action@778f636ab4ed6f694fb5e2ef1942ea2ae557abf8 # v1.8.0
         with:
           token: ${{ github.token }}
           branch: ${{ env.BRANCH_NAME }}
 
       - name: Create Draft Release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@2c591bcc8ecdcd2db72b97d6147f871fcd833ba5 # v1.14.0
         with:
           prerelease: true
           draft: false
@@ -190,14 +190,14 @@ jobs:
 
       - name: Update CHANGELOG
         id: changelog
-        uses: requarks/changelog-action@v1
+        uses: requarks/changelog-action@012e5ba8f4e936cdb2f3b6cd2f81a82cd57a7bf3 # v1.10.2
         with:
           token: ${{ github.token }}
           tag: ${{ steps.semver.outputs.next }}
           writeToFile: false
 
       - name: Create Release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@2c591bcc8ecdcd2db72b97d6147f871fcd833ba5 # v1.14.0
         with:
           prerelease: ${{ env.PRERELEASE }}
           allowUpdates: true
@@ -219,12 +219,12 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           path: artifacts
 
       - name: Upload artifacts to release
-        uses: svenstaro/upload-release-action@v2
+        uses: svenstaro/upload-release-action@04733e069f2d7f7f0b4aebc4fbdbce8613b03ccd # v2.9.0
         with:
           repo_token: ${{ github.token }}
           file_glob: true

@@ -32,11 +32,43 @@ struct Hentai : Command {
 				  .build()),
 		  m_reddit{creator.http().get_executor(),
 				   RedditOptions{
-					   std::getenv("SABER_REDDIT_USERNAME"),
-					   std::getenv("SABER_REDDIT_PASSWORD"),
-					   std::getenv("SABER_REDDIT_APP_ID"),
-					   std::getenv("SABER_REDDIT_APP_SECRET"),
+					   safe_getenv("SABER_REDDIT_USERNAME"),
+					   safe_getenv("SABER_REDDIT_PASSWORD"),
+					   safe_getenv("SABER_REDDIT_APP_ID"),
+					   safe_getenv("SABER_REDDIT_APP_SECRET"),
 				   }} {}
+
+   private:
+	static std::string safe_getenv(const char *name) {
+		const char *val = std::getenv(name);
+		return val ? val : "";
+	}
+
+	static bool env_exists(const char *name) {
+		const char *val = std::getenv(name);
+		return val != nullptr && val[0] != '\0';
+	}
+
+   public:
+	Result<> setup(
+		[[maybe_unused]] const boost::asio::yield_context &yield) override {
+		// Validate required environment variables
+		static constexpr std::array required_vars = {
+			"SABER_REDDIT_USERNAME", "SABER_REDDIT_PASSWORD",
+			"SABER_REDDIT_APP_ID", "SABER_REDDIT_APP_SECRET"};
+
+		for (const auto *var : required_vars) {
+			if (!env_exists(var)) {
+				bot.log<ekizu::LogLevel::Warn>(
+					"Hentai command disabled: {} not set", var);
+				options.enabled = false;
+				return outcome::success();
+			}
+		}
+
+		bot.log<ekizu::LogLevel::Info>("Hentai command initialized");
+		return outcome::success();
+	}
 
 	Result<> execute(const ekizu::Message &message,
 					 const std::vector<std::string> &args,
