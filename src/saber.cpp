@@ -865,18 +865,27 @@ Result<std::vector<ekizu::ApplicationCommand>> Saber::register_slash_commands(
 	m_commands.get_commands([&](const auto &cmd_map) {
 		for (const auto &[name, cmd] : cmd_map) {
 			if (!cmd || !cmd->options.enabled) { continue; }
+			if (!cmd->options.slash_options) { continue; }
+
+			// Global registration: only register non-guild-only commands
+			// Guild-only commands should be registered per-guild instead
+			if (cmd->options.guild_only) { continue; }
 
 			ekizu::ApplicationCommandCreateFields fields;
 			fields.name = cmd->options.name;
-			fields.description = cmd->options.description.empty()
-									 ? "No description"
-									 : cmd->options.description;
+			// Discord requires description to be 1-100 characters
+			auto desc = cmd->options.description.empty()
+							? "No description"
+							: cmd->options.description;
+			if (desc.size() > 100) { desc = desc.substr(0, 97) + "..."; }
+			fields.description = std::move(desc);
 			fields.type = ekizu::ApplicationCommandType::ChatInput;
+			fields.options = *cmd->options.slash_options;
 
-			// Add options if defined
-			if (cmd->options.slash_options) {
-				fields.options = *cmd->options.slash_options;
-			}
+			// Allow in guilds, bot DMs, and private channels
+			fields.contexts = {ekizu::InteractionContextType::Guild,
+							   ekizu::InteractionContextType::BotDm,
+							   ekizu::InteractionContextType::PrivateChannel};
 
 			commands.push_back(std::move(fields));
 		}
@@ -899,18 +908,25 @@ Saber::register_guild_slash_commands(ekizu::Snowflake guild_id,
 	m_commands.get_commands([&](const auto &cmd_map) {
 		for (const auto &[name, cmd] : cmd_map) {
 			if (!cmd || !cmd->options.enabled) { continue; }
+			if (!cmd->options.slash_options) { continue; }
+
+			// Guild registration: only register guild-only commands
+			// Non-guild-only commands are registered globally instead
+			if (!cmd->options.guild_only) { continue; }
 
 			ekizu::ApplicationCommandCreateFields fields;
 			fields.name = cmd->options.name;
-			fields.description = cmd->options.description.empty()
-									 ? "No description"
-									 : cmd->options.description;
+			// Discord requires description to be 1-100 characters
+			auto desc = cmd->options.description.empty()
+							? "No description"
+							: cmd->options.description;
+			if (desc.size() > 100) { desc = desc.substr(0, 97) + "..."; }
+			fields.description = std::move(desc);
 			fields.type = ekizu::ApplicationCommandType::ChatInput;
+			fields.options = *cmd->options.slash_options;
 
-			// Add options if defined
-			if (cmd->options.slash_options) {
-				fields.options = *cmd->options.slash_options;
-			}
+			// Guild-only commands only work in guilds
+			fields.contexts = {ekizu::InteractionContextType::Guild};
 
 			commands.push_back(std::move(fields));
 		}

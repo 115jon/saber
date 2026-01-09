@@ -15,6 +15,7 @@ struct Join : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})  // No options needed
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -35,6 +36,35 @@ struct Join : Command {
 						  .send(yield));
 		}
 
+		return outcome::success();
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		if (!interaction.guild_id) {
+			return boost::system::errc::operation_not_permitted;
+		}
+
+		SABER_TRY(
+			auto voice_state, util::in_voice_channel(bot, interaction, yield));
+		SABER_TRY(auto just_connected,
+				  bot.player().connect(
+					  *interaction.guild_id, *voice_state->channel_id, yield));
+
+		std::string content =
+			just_connected ? "🎵 Joined voice channel!"
+						   : "I am already in a voice channel!";
+
+		SABER_TRY(bot.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .content(std::move(content))
+							  .build())
+					  .send(yield));
 		return outcome::success();
 	}
 };

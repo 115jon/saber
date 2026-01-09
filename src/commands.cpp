@@ -14,20 +14,6 @@ constexpr boost::string_view LIBRARY_EXTENSION{".so"};
 constexpr boost::string_view LIBRARY_EXTENSION{".dylib"};
 #endif
 
-std::optional<ekizu::Snowflake> interaction_user_id(
-	const ekizu::Interaction &i) {
-	if (i.member) { return i.member->user.id; }
-	if (i.user) { return i.user->id; }
-	return std::nullopt;
-}
-
-std::optional<ekizu::Snowflake> interaction_channel_id(
-	const ekizu::Interaction &i) {
-	if (i.channel_id) { return i.channel_id; }
-	if (i.channel) { return i.channel->id; }
-	return std::nullopt;
-}
-
 bool has_permissions(ekizu::Permissions granted, ekizu::Permissions required) {
 	using U = std::underlying_type_t<ekizu::Permissions>;
 	const auto g = static_cast<U>(granted);
@@ -35,79 +21,241 @@ bool has_permissions(ekizu::Permissions granted, ekizu::Permissions required) {
 	return (g & r) == r;
 }
 
-std::optional<ekizu::Permissions> parse_member_permissions(
-	const ekizu::Interaction &i) {
-	if (!i.member) { return std::nullopt; }
-	// Discord provides interaction member permissions as a string integer.
-	try {
-		const auto v = std::stoull(i.member->permissions);
-		if (v > std::numeric_limits<
-					std::underlying_type_t<ekizu::Permissions>>::max()) {
-			return std::nullopt;
-		}
-		return static_cast<ekizu::Permissions>(
-			static_cast<std::underlying_type_t<ekizu::Permissions>>(v));
-	} catch (...) { return std::nullopt; }
-}
 }  // namespace
 
 namespace saber {
+
+// ---------------------------------------------------------------------------
+// CommandInvocation - common fields extracted from Message or Interaction
+// ---------------------------------------------------------------------------
+
+struct CommandInvocation {
+	ekizu::Snowflake user_id;
+	std::optional<ekizu::Snowflake> guild_id;
+	std::optional<ekizu::Snowflake> channel_id;
+	std::optional<ekizu::Snowflake> message_id;	 // for replies (message only)
+	ekizu::Permissions bot_permissions{};
+	ekizu::Permissions member_permissions{};
+};
+
+static CommandInvocation from_message(const ekizu::Message &msg,
+									  [[maybe_unused]] Saber &bot) {
+	CommandInvocation inv;
+	inv.user_id = msg.author.id;
+	inv.guild_id = msg.guild_id;
+	inv.channel_id = msg.channel_id;
+	inv.message_id = msg.id;
+
+	// For messages, we need to look up permissions from the guild cache.
+	// This is best-effort - we'll check them via util::ensure_permissions.
+	inv.bot_permissions = ekizu::Permissions{};
+	inv.member_permissions = ekizu::Permissions{};
+
+	return inv;
+}
+
+static CommandInvocation from_interaction(const ekizu::Interaction &i) {
+	CommandInvocation inv;
+
+	// Extract user ID
+	if (i.member) {
+		inv.user_id = i.member->user.id;
+	} else if (i.user) {
+		inv.user_id = i.user->id;
+	}
+
+	inv.guild_id = i.guild_id;
+
+	// Extract channel ID
+	if (i.channel_id) {
+		inv.channel_id = i.channel_id;
+	} else if (i.channel) {
+		inv.channel_id = i.channel->id;
+	}
+
+	// Discord provides bot permissions directly on interactions
+	if (i.app_permissions) { inv.bot_permissions = *i.app_permissions; }
+
+	// Parse member permissions from the interaction
+	if (i.member) {
+		try {
+			const auto v = std::stoull(i.member->permissions);
+			if (v <= std::numeric_limits<
+						 std::underlying_type_t<ekizu::Permissions>>::max()) {
+				inv.member_permissions = static_cast<ekizu::Permissions>(
+					static_cast<std::underlying_type_t<ekizu::Permissions>>(v));
+			}
+		} catch (...) {}
+	}
+
+	return inv;
+}
+
+// ---------------------------------------------------------------------------
+// Gate check result - used to determine how to respond to gate failures
+// ---------------------------------------------------------------------------
+
+enum class GateResult {
+	Passed,
+	GuildOnly,
+	BotPermission,
+	MemberPermission,
+	Cooldown
+};
+
+struct GateCheckResult {
+	GateResult result{GateResult::Passed};
+	int64_t cooldown_remaining{0};	// seconds remaining if cooldown active
+};
+
+// ---------------------------------------------------------------------------
+// Common gate checks - extracted to reduce duplication
+// ---------------------------------------------------------------------------
+
+static GateCheckResult check_common_gates(Saber &bot, Command &cmd,
+										  const CommandInvocation &inv,
+										  const std::string &command_name) {
+	GateCheckResult result;
+
+	// Owner bypasses all gates except guild-only (which is a technical
+	// requirement)
+	const bool is_owner = (inv.user_id == bot.owner_id());
+
+	// Guild-only gate - even owner can't use guild commands in DMs
+	if (cmd.options.guild_only && !inv.guild_id) {
+		result.result = GateResult::GuildOnly;
+		return result;
+	}
+
+	// Permission gates only apply in guilds - DMs don't have permission
+	// concepts Owner bypasses member permission checks
+	if (inv.guild_id && !is_owner) {
+		// Bot permission gate (only for interactions where we have the info)
+		using U = std::underlying_type_t<ekizu::Permissions>;
+		if (static_cast<U>(cmd.options.bot_permissions) != 0 &&
+			static_cast<U>(inv.bot_permissions) != 0) {
+			if (!has_permissions(
+					inv.bot_permissions, cmd.options.bot_permissions)) {
+				result.result = GateResult::BotPermission;
+				return result;
+			}
+		}
+
+		// Member permission gate (only for interactions where we have the info)
+		if (static_cast<U>(cmd.options.member_permissions) != 0 &&
+			static_cast<U>(inv.member_permissions) != 0) {
+			if (!has_permissions(
+					inv.member_permissions, cmd.options.member_permissions)) {
+				result.result = GateResult::MemberPermission;
+				return result;
+			}
+		}
+	}
+
+	// Cooldown gate - owner bypasses cooldowns
+	if (!is_owner && bot.command_cooldowns().contains(inv.user_id)) {
+		auto &cooldown = bot.command_cooldowns().at(inv.user_id);
+
+		if (cooldown.contains(command_name)) {
+			auto expiry = cooldown.at(command_name);
+			auto delta = std::chrono::floor<std::chrono::seconds>(
+							 expiry - std::chrono::steady_clock::now())
+							 .count();
+
+			if (delta > 0) {
+				result.result = GateResult::Cooldown;
+				result.cooldown_remaining = delta;
+				return result;
+			}
+		}
+	}
+
+	return result;
+}
+
+static void update_cooldown(Saber &bot, const CommandInvocation &inv,
+							const std::string &command_name,
+							std::chrono::steady_clock::duration cooldown) {
+	bot.command_cooldowns()[inv.user_id][command_name] =
+		std::chrono::steady_clock::now() + cooldown;
+}
+
+// ---------------------------------------------------------------------------
+// CommandLoader implementation
+// ---------------------------------------------------------------------------
+
 CommandLoader::CommandLoader(Saber &parent) : m_parent{parent} {}
 
 void CommandLoader::load(std::string_view path,
 						 const boost::asio::yield_context &yield) {
-	auto library = Library::create(path);
+	auto library_result = Library::create(path);
 
-	if (!library) {
-		m_parent.log<ekizu::LogLevel::Error>(
-			"Failed to load command {}: {}", path, library.error().message());
+	if (!library_result) {
+		m_parent.log<ekizu::LogLevel::Error>("Failed to load library {}", path);
 		return;
 	}
 
-	auto init_command =
-		library.value().get<Command *(*)(Saber &)>("init_command");
-	auto free_command =
-		library.value().get<void (*)(Command *)>("free_command");
+	auto &library = library_result.value();
 
-	if (!init_command || !free_command) { return; }
+	auto init_result = library.get<Command *(*)(Saber &)>("init_command");
 
-	std::scoped_lock lk{m_mtx};
-	auto *command_ptr = (init_command.value())(m_parent);
+	if (!init_result) {
+		m_parent.log<ekizu::LogLevel::Error>(
+			"Failed to find init_command in {}", path);
+		return;
+	}
 
-	if (command_ptr == nullptr) { return; }
+	auto init_fn = init_result.value();
+	auto free_fn_result = library.get<void (*)(Command *)>("free_command");
+	auto free_fn = free_fn_result ? free_fn_result.value() : nullptr;
+
+	const auto command_ptr =
+		std::shared_ptr<Command>(init_fn(m_parent), free_fn);
+
+	if (!command_ptr) {
+		m_parent.log<ekizu::LogLevel::Error>(
+			"init_command returned nullptr for {}", path);
+		return;
+	}
+
+	if (!command_ptr->options.enabled) {
+		m_parent.log<ekizu::LogLevel::Info>(
+			"Command {} is disabled, skipping load", command_ptr->options.name);
+		return;
+	}
 
 	if (command_ptr->options.init) {
-		auto res = command_ptr->setup(yield);
-
-		if (!res) {
+		if (!command_ptr->setup(yield)) {
 			m_parent.log<ekizu::LogLevel::Error>(
-				"Failed to setup command {}: {}", command_ptr->options.name,
-				res.error().message());
+				"Failed to setup command {}", command_ptr->options.name);
 			return;
 		}
 	}
 
-	const auto &command_name = command_ptr->options.name;
-	const std::shared_ptr<Command> loader{
-		command_ptr,
-		[dealloc = free_command.value()](Command *ptr) { dealloc(ptr); }};
-
-	commands.insert_or_assign(command_name, std::move(library.value()));
-	command_map.insert_or_assign(command_name, loader);
+	std::scoped_lock lk{m_mtx};
+	std::string command_name = command_ptr->options.name;
+	commands.insert_or_assign(command_name, std::move(library));
+	command_map.insert_or_assign(command_name, command_ptr);
 
 	for (const auto &alias : command_ptr->options.aliases) {
-		alias_map.insert_or_assign(alias, loader);
+		alias_map.insert_or_assign(alias, command_ptr);
 	}
 
 	if (command_ptr->options.slash_options) {
-		slash_commands.insert_or_assign(command_name, loader);
+		slash_commands.insert_or_assign(command_name, command_ptr);
 	}
 
 	if (command_ptr->options.user) {
-		user_commands.insert_or_assign(command_name, loader);
+		user_commands.insert_or_assign(command_name, command_ptr);
 	}
 
-	m_parent.log<ekizu::LogLevel::Info>("Loaded command {}", command_name);
+	// Log with command type indicators
+	const bool has_slash = command_ptr->options.slash_options.has_value();
+	const bool has_user_ctx = command_ptr->options.user;
+
+	m_parent.log<ekizu::LogLevel::Info>(
+		"Loaded {:15} [msg: Y] [slash: {}] [user: {}]", command_name,
+		has_slash ? "Y" : "N", has_user_ctx ? "Y" : "N");
 }
 
 void CommandLoader::load_all(const boost::asio::yield_context &yield) {
@@ -155,15 +303,17 @@ Result<> CommandLoader::process_commands(
 
 	if (!cmd) { return outcome::success(); }
 
-	if (cmd->options.guild_only) {
-		if (!message.guild_id) {
-			SABER_TRY(m_parent.http()
-						  .create_message(message.channel_id)
-						  .content("This command can only be used in guilds.")
-						  .reply(message.id)
-						  .send(yield));
-			return outcome::success();
-		}
+	auto inv = from_message(message, m_parent);
+
+	// For messages, use the existing permission check utilities
+	// which look up permissions from the guild cache
+	if (cmd->options.guild_only && !message.guild_id) {
+		SABER_TRY(m_parent.http()
+					  .create_message(message.channel_id)
+					  .content("This command can only be used in guilds.")
+					  .reply(message.id)
+					  .send(yield));
+		return outcome::success();
 	}
 
 	SABER_TRY(util::ensure_permissions(m_parent, message, m_parent.bot_id(),
@@ -171,32 +321,21 @@ Result<> CommandLoader::process_commands(
 	SABER_TRY(util::ensure_permissions(m_parent, message, message.author.id,
 									   cmd->options.member_permissions, yield));
 
-	if (m_parent.command_cooldowns().contains(message.author.id)) {
-		auto cooldown = m_parent.command_cooldowns().at(message.author.id);
-
-		if (cooldown.contains(command_name)) {
-			auto expiry = cooldown.at(command_name);
-			auto delta = std::chrono::floor<std::chrono::seconds>(
-							 expiry - std::chrono::steady_clock::now())
-							 .count();
-
-			if (delta > 0) {
-				SABER_TRY(
-					m_parent.http()
-						.create_message(message.channel_id)
-						.content(fmt::format(
-							"Please wait {} more seconds before using this "
-							"command.",
-							delta))
-						.reply(message.id)
-						.send(yield));
-				return outcome::success();
-			}
-		}
+	// Cooldown check
+	auto gate_result = check_common_gates(m_parent, *cmd, inv, command_name);
+	if (gate_result.result == GateResult::Cooldown) {
+		SABER_TRY(
+			m_parent.http()
+				.create_message(message.channel_id)
+				.content(fmt::format(
+					"Please wait {} more seconds before using this command.",
+					gate_result.cooldown_remaining))
+				.reply(message.id)
+				.send(yield));
+		return outcome::success();
 	}
 
-	m_parent.command_cooldowns()[message.author.id][command_name] =
-		std::chrono::steady_clock::now() + cmd->options.cooldown;
+	update_cooldown(m_parent, inv, command_name, cmd->options.cooldown);
 
 	// NOTE: I'm seeing a case in which the commands will need the lock so it
 	// should be unlocked here. i.e. an unload command or something.
@@ -216,8 +355,8 @@ Result<> CommandLoader::process_commands(
 		return outcome::success();
 	}
 
-	const auto user_id = interaction_user_id(interaction);
-	if (!user_id) { return outcome::success(); }
+	auto inv = from_interaction(interaction);
+	if (inv.user_id == ekizu::Snowflake{}) { return outcome::success(); }
 
 	if (!interaction.data) { return outcome::success(); }
 
@@ -256,80 +395,45 @@ Result<> CommandLoader::process_commands(
 
 	if (!cmd) { return outcome::success(); }
 
-	// guild_only gate
-	if (cmd->options.guild_only && !interaction.guild_id) {
-		if (auto ch = interaction_channel_id(interaction)) {
-			SABER_TRY(m_parent.http()
-						  .create_message(*ch)
-						  .content("This command can only be used in guilds.")
-						  .send(yield));
-		}
+	// Check common gates
+	auto gate_result = check_common_gates(m_parent, *cmd, inv, command_name);
+
+	// Helper to send ephemeral interaction response for gate failures
+	auto send_gate_error = [&](std::string content) -> Result<> {
+		SABER_TRY(m_parent.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .content(std::move(content))
+							  .flags(ekizu::MessageFlags::Ephemeral)
+							  .build())
+					  .send(yield));
 		return outcome::success();
+	};
+
+	switch (gate_result.result) {
+		case GateResult::GuildOnly:
+			return send_gate_error("This command can only be used in guilds.");
+
+		case GateResult::BotPermission:
+			return send_gate_error("I don't have permission to run that here.");
+
+		case GateResult::MemberPermission:
+			return send_gate_error(
+				"You don't have permission to use that command.");
+
+		case GateResult::Cooldown:
+			return send_gate_error(fmt::format(
+				"Please wait {} more seconds before using this command.",
+				gate_result.cooldown_remaining));
+
+		case GateResult::Passed: break;
 	}
 
-	// bot permission gate (best-effort: only enforce if Discord provided them)
-	if (static_cast<std::underlying_type_t<ekizu::Permissions>>(
-			cmd->options.bot_permissions) != 0) {
-		if (interaction.app_permissions &&
-			!has_permissions(
-				*interaction.app_permissions, cmd->options.bot_permissions)) {
-			if (auto ch = interaction_channel_id(interaction)) {
-				SABER_TRY(
-					m_parent.http()
-						.create_message(*ch)
-						.content("I don't have permission to run that here.")
-						.send(yield));
-			}
-			return outcome::success();
-		}
-	}
-
-	// member permission gate (best-effort: only enforce if provided)
-	if (static_cast<std::underlying_type_t<ekizu::Permissions>>(
-			cmd->options.member_permissions) != 0) {
-		const auto member_perms = parse_member_permissions(interaction);
-		if (member_perms &&
-			!has_permissions(*member_perms, cmd->options.member_permissions)) {
-			if (auto ch = interaction_channel_id(interaction)) {
-				SABER_TRY(
-					m_parent.http()
-						.create_message(*ch)
-						.content(
-							"You don't have permission to use that command.")
-						.send(yield));
-			}
-			return outcome::success();
-		}
-	}
-
-	// cooldown gate
-	if (m_parent.command_cooldowns().contains(*user_id)) {
-		auto cooldown = m_parent.command_cooldowns().at(*user_id);
-
-		if (cooldown.contains(command_name)) {
-			auto expiry = cooldown.at(command_name);
-			auto delta = std::chrono::floor<std::chrono::seconds>(
-							 expiry - std::chrono::steady_clock::now())
-							 .count();
-
-			if (delta > 0) {
-				if (auto ch = interaction_channel_id(interaction)) {
-					SABER_TRY(
-						m_parent.http()
-							.create_message(*ch)
-							.content(fmt::format(
-								"Please wait {} more seconds before using this "
-								"command.",
-								delta))
-							.send(yield));
-				}
-				return outcome::success();
-			}
-		}
-	}
-
-	m_parent.command_cooldowns()[*user_id][command_name] =
-		std::chrono::steady_clock::now() + cmd->options.cooldown;
+	update_cooldown(m_parent, inv, command_name, cmd->options.cooldown);
 
 	// Same rationale as message path: commands may need the lock (e.g. unload).
 	lk.unlock();

@@ -16,26 +16,45 @@ struct Hype : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
-					 const std::vector<std::string> &args,
+					 [[maybe_unused]] const std::vector<std::string> &args,
 					 const boost::asio::yield_context &yield) override {
-		if (!args.empty()) { return outcome::success(); }
+		return do_hype([&](std::string content) {
+			return bot.http()
+				.create_message(message.channel_id)
+				.content(std::move(content))
+				.send(yield);
+		});
+	}
 
-		const std::string &selectedHype =
-			hypu[util::get_random_number<size_t>(0, hypu.size() - 1)];
-		std::string msg = ":train2: CHOO CHOO " + selectedHype;
-
-		SABER_TRY(bot.http()
-					  .create_message(message.channel_id)
-					  .content(msg)
-					  .send(yield));
-
-		return outcome::success();
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		return do_hype([&](std::string content) {
+			return bot.http()
+				.interaction(interaction.application_id)
+				.create_response(
+					interaction.id, interaction.token,
+					ekizu::InteractionResponseBuilder()
+						.type(ekizu::InteractionResponseType::
+								  ChannelMessageWithSource)
+						.content(std::move(content))
+						.build())
+				.send(yield);
+		});
 	}
 
    private:
+	template <typename SendReply>
+	Result<> do_hype(SendReply send_reply) {
+		auto msg = ":train2: CHOO CHOO " +
+				   hypu[util::get_random_number<size_t>(0, hypu.size() - 1)];
+		SABER_TRY(send_reply(std::move(msg)));
+		return outcome::success();
+	}
+
 	std::vector<std::string> hypu{
 		"https://cdn.discordapp.com/attachments/102817255661772800/"
 		"219514281136357376/tumblr_nr6ndeEpus1u21ng6o1_540.gif",

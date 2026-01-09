@@ -61,6 +61,79 @@ constexpr uint16_t k_color_err = 0xB000;
 
 [[nodiscard]] SABER_EXPORT std::string format_duration(uint64_t duration);
 
+// ---------------------------------------------------------------------------
+// Interaction helpers - extract common fields for slash command handlers
+// ---------------------------------------------------------------------------
+
+/// Get the username of the user who invoked the interaction.
+[[nodiscard]] SABER_EXPORT std::string get_username(
+	const ekizu::Interaction &interaction);
+
+/// Get the user ID of the user who invoked the interaction.
+[[nodiscard]] SABER_EXPORT std::optional<ekizu::Snowflake> get_user_id(
+	const ekizu::Interaction &interaction);
+
+/// Get the guild ID from the interaction (if it was invoked in a guild).
+[[nodiscard]] inline std::optional<ekizu::Snowflake> get_guild_id(
+	const ekizu::Interaction &interaction) {
+	return interaction.guild_id;
+}
+
+/// Get the channel ID from the interaction.
+[[nodiscard]] SABER_EXPORT std::optional<ekizu::Snowflake> get_channel_id(
+	const ekizu::Interaction &interaction);
+
+/// Get the ApplicationCommandData from an interaction (if it's an app command).
+[[nodiscard]] SABER_EXPORT const ekizu::ApplicationCommandData *
+get_command_data(const ekizu::Interaction &interaction);
+
+/// Get a typed option value from an interaction by name.
+/// Supports: int64_t, double, bool, std::string, ekizu::Snowflake
+template <typename T>
+[[nodiscard]] std::optional<T> get_option(const ekizu::Interaction &interaction,
+										  std::string_view name) {
+	const auto *cmd_data = get_command_data(interaction);
+	if (!cmd_data) { return std::nullopt; }
+
+	for (const auto &opt : cmd_data->options) {
+		if (opt.name == name && opt.value) {
+			if constexpr (std::is_same_v<T, int64_t>) {
+				if (const auto *val = std::get_if<int64_t>(&*opt.value)) {
+					return *val;
+				}
+			} else if constexpr (std::is_same_v<T, double>) {
+				if (const auto *val = std::get_if<double>(&*opt.value)) {
+					return *val;
+				}
+			} else if constexpr (std::is_same_v<T, bool>) {
+				if (const auto *val = std::get_if<bool>(&*opt.value)) {
+					return *val;
+				}
+			} else if constexpr (std::is_same_v<T, std::string>) {
+				if (const auto *val = std::get_if<std::string>(&*opt.value)) {
+					return *val;
+				}
+			} else if constexpr (std::is_same_v<T, ekizu::Snowflake>) {
+				if (const auto *val =
+						std::get_if<ekizu::Snowflake>(&*opt.value)) {
+					return *val;
+				}
+			}
+		}
+	}
+	return std::nullopt;
+}
+
+/// Convenience: get an integer option and cast to any integral type.
+template <typename T>
+[[nodiscard]] std::enable_if_t<
+	std::is_integral_v<T> && !std::is_same_v<T, bool>, std::optional<T>>
+get_int_option(const ekizu::Interaction &interaction, std::string_view name) {
+	auto val = get_option<int64_t>(interaction, name);
+	if (val) { return static_cast<T>(*val); }
+	return std::nullopt;
+}
+
 }  // namespace saber::util
 
 #endif	// SABER_UTIL_HPP

@@ -1,59 +1,50 @@
-name: CI
-
+name: Saber CI
 on:
   push:
     branches:
       - main
       - dev
     paths:
-      - "**ci.yml"
+      - ".github/workflows/ci.yml"
       - "**.hpp"
       - "**.cpp"
       - "**CMakeLists.txt"
+      - "vcpkg.json"
+      - "vcpkg-configuration.json"
   pull_request:
     branches:
       - main
       - dev
     paths:
-      - "**ci.yml"
+      - ".github/workflows/ci.yml"
       - "**.hpp"
       - "**.cpp"
       - "**CMakeLists.txt"
+      - "vcpkg.json"
+      - "vcpkg-configuration.json"
 
 env:
   BRANCH_NAME: ${{ github.ref == 'refs/heads/dev' && 'dev' || 'main' }}
   PRERELEASE: ${{ github.ref == 'refs/heads/dev' && 'true' || 'false' }}
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
-  build:
+  linux:
+    name: linux-${{ matrix.arch }}-${{ matrix.config }}-${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        config:
-          - {
-              os: ubuntu-22.04,
-              arch: x64,
-              binary_path: saber,
-              output_name: saber-linux-x64,
-            }
-          - {
-              os: windows-2022,
-              arch: x64,
-              binary_path: saber.exe,
-              output_name: saber-windows-x64.exe,
-            }
-          - {
-              os: windows-2022,
-              arch: x86,
-              binary_path: saber.exe,
-              output_name: saber-windows-x86.exe,
-            }
+        arch: [x64]
+        config: [Release]
+        compiler: ["g++-12"]
 
-    name: build-${{ matrix.config.os }}-${{ matrix.config.arch }}
-    runs-on: ${{ matrix.config.os }}
+    env:
+      OUTPUT_NAME: saber-linux-${{ matrix.arch }}-${{ matrix.config }}
 
     steps:
       - name: Checkout
@@ -61,60 +52,116 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++-12 libssl-dev ninja-build rpm zlib1g-dev libtool autoconf
+          sudo apt-get install -y cmake ninja-build rpm \
+            libssl-dev zlib1g-dev linux-libc-dev \
+            libtool autoconf pkg-config \
+            ${{ matrix.compiler }}
 
       - name: Install dependencies (vcpkg)
         uses: johnwason/vcpkg-action@v7
         id: vcpkg
         with:
           manifest-dir: ${{ github.workspace }}
-          triplet: ${{ runner.os == 'Windows' && matrix.config.arch == 'x64' && 'x64-windows-release' || runner.os == 'Windows' && 'x86-windows' || 'x64-linux' }}
-          cache-key: ${{ runner.os }}-${{ matrix.config.arch }}-${{ runner.os == 'Windows' && matrix.config.arch == 'x64' && 'x64-windows-release' || runner.os == 'Windows' && 'x86-windows' || 'x64-linux' }}-vcpkg
+          triplet: x64-linux
+          cache-key: linux-${{ matrix.arch }}-${{ matrix.config }}-vcpkg
           token: ${{ github.token }}
 
-      - name: Add MSBuild to PATH (Windows)
-        if: runner.os == 'Windows'
-        uses: microsoft/setup-msbuild@v1.1
-
-      - name: Configure CMake (Linux)
-        if: runner.os == 'Linux'
-        run: cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Configure CMake
+        run: |
+          cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} \
+            -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
         env:
-          CXX: g++-12
-
-      - name: Configure CMake (Windows x64)
-        if: runner.os == 'Windows' && matrix.config.arch == 'x64'
-        run: cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} -S . -B build -G "Visual Studio 17 2022" -A x64 -T host=x64
-
-      - name: Configure CMake (Windows x86)
-        if: runner.os == 'Windows' && matrix.config.arch == 'x86'
-        run: cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} -S . -B build -G "Visual Studio 17 2022" -A Win32 -T host=x86
+          CXX: ${{ matrix.compiler }}
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --config ${{ matrix.config }} -j $(nproc)
 
-      - name: Move binary (Linux)
-        if: runner.os == 'Linux'
-        run: mv build/bin/${{ matrix.config.binary_path }} build/bin/${{ matrix.config.output_name }}
-
-      - name: Move binary (Windows)
-        if: runner.os == 'Windows'
-        run: Move-Item build/bin/${{ matrix.config.binary_path }} build/bin/${{ matrix.config.output_name }}
+      - name: Rename binary
+        run: mv build/bin/saber build/bin/${{ env.OUTPUT_NAME }}
 
       - name: Upload Binary
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.config.output_name }}
-          path: ./build/bin/${{ matrix.config.output_name }}
+          name: ${{ env.OUTPUT_NAME }}
+          path: build/bin/${{ env.OUTPUT_NAME }}
+          if-no-files-found: error
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64]
+        config: [Release]
+        vs:
+          - { name: 2022, version: 17, os: windows-2022 }
+
+    name: windows-${{ matrix.arch }}-${{ matrix.config }}-vs${{ matrix.vs.name }}
+    runs-on: ${{ matrix.vs.os }}
+
+    env:
+      OUTPUT_NAME: saber-windows-${{ matrix.arch }}-${{ matrix.config }}.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies (vcpkg)
+        uses: johnwason/vcpkg-action@v7
+        id: vcpkg
+        with:
+          manifest-dir: ${{ github.workspace }}
+          triplet: ${{ matrix.arch }}-windows-release
+          cache-key: windows-${{ matrix.arch }}-${{ matrix.config }}-vcpkg
+          token: ${{ github.token }}
+
+      - name: Configure CMake
+        run: |
+          cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }} `
+            -S . -B build `
+            -G "Visual Studio ${{ matrix.vs.version }} ${{ matrix.vs.name }}" `
+            -A ${{ matrix.arch }} `
+            -T host=${{ matrix.arch }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Rename binary
+        run: Move-Item build/bin/${{ matrix.config }}/saber.exe build/bin/${{ env.OUTPUT_NAME }}
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}
+          path: build/bin/${{ env.OUTPUT_NAME }}
           if-no-files-found: error
 
   release:
-    needs: build
-    runs-on: ubuntu-22.04
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push'
 
     steps:
@@ -131,7 +178,7 @@ jobs:
           branch: ${{ env.BRANCH_NAME }}
 
       - name: Create Draft Release
-        uses: ncipollo/release-action@v1.12.0
+        uses: ncipollo/release-action@v1
         with:
           prerelease: true
           draft: false
@@ -150,7 +197,7 @@ jobs:
           writeToFile: false
 
       - name: Create Release
-        uses: ncipollo/release-action@v1.12.0
+        uses: ncipollo/release-action@v1
         with:
           prerelease: ${{ env.PRERELEASE }}
           allowUpdates: true
@@ -167,19 +214,19 @@ jobs:
 
   upload:
     needs: release
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push'
 
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: .
+          path: artifacts
 
       - name: Upload artifacts to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ github.token }}
           file_glob: true
-          file: "**/*"
+          file: "artifacts/**/*"
           tag: ${{ needs.release.outputs.next }}

@@ -210,10 +210,14 @@ struct Command {
 		return ekizu::outcome::success();
 	}
 
-	/// Method reserved for message commands' execution.
+	/// Method reserved for message commands' execution (legacy).
+	/// Override if you want to support text-based commands.
 	[[nodiscard]] virtual Result<> execute(
-		const ekizu::Message &message, const std::vector<std::string> &args,
-		const boost::asio::yield_context &yield) = 0;
+		[[maybe_unused]] const ekizu::Message &message,
+		[[maybe_unused]] const std::vector<std::string> &args,
+		[[maybe_unused]] const boost::asio::yield_context &yield) {
+		return ekizu::outcome::success();
+	}
 
 	/// Method reserved for interaction commands' execution
 	/// (slash/context/autocomplete).

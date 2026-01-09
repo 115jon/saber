@@ -1,6 +1,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <saber/saber.hpp>
+#include <saber/util.hpp>
 
 using namespace saber;
 
@@ -15,24 +16,34 @@ boost::unordered_flat_map<std::string_view, std::string_view> CATEGORY_EMOJIS{
     {"Steam", "🚂",},
     {"Guild", "🏠",},
     {"Misc", "❓",},
-    {"Activity", "👷"}
+    {"Activity", "👷"},
+    {"Dev", "🔧"}
 };
 // clang-format on
 
 struct Help : Command {
 	explicit Help(Saber &creator)
-		: Command(creator,
-				  CommandOptionsBuilder()
-					  .name("help")
-					  .category(DIRNAME)
-					  .enabled(true)
-					  .init(true)
-					  .usage("help")
-					  .examples({"help", "help ping"})
-					  .bot_permissions(ekizu::Permissions::SendMessages |
-									   ekizu::Permissions::EmbedLinks)
-					  .cooldown(std::chrono::seconds(2))
-					  .build()) {}
+		: Command(
+			  creator,
+			  CommandOptionsBuilder()
+				  .name("help")
+				  .category(DIRNAME)
+				  .enabled(true)
+				  .init(true)
+				  .usage("help [command]")
+				  .description("Shows help information.")
+				  .examples({"help", "help ping"})
+				  .bot_permissions(ekizu::Permissions::SendMessages |
+								   ekizu::Permissions::EmbedLinks)
+				  .cooldown(std::chrono::seconds(2))
+				  .slash_options(
+					  {ekizu::ApplicationCommandOptionBuilder()
+						   .type(ekizu::ApplicationCommandOptionType::String)
+						   .name("command")
+						   .description("Command name to get help for")
+						   .required(false)
+						   .build()})
+				  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
 					 const std::vector<std::string> &args,
@@ -40,6 +51,158 @@ struct Help : Command {
 		if (args.empty()) { return get_help(message, yield); }
 
 		return get_command_help(message, args[0], yield);
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		auto cmd_name = util::get_option<std::string>(interaction, "command");
+
+		if (!cmd_name) {
+			// Show general help
+			return get_help_interaction(interaction, yield);
+		}
+
+		return get_command_help_interaction(interaction, *cmd_name, yield);
+	}
+
+   private:
+	Result<> get_help_interaction(const ekizu::Interaction &interaction,
+								  const boost::asio::yield_context &yield) {
+		boost::unordered_flat_map<std::string,
+								  std::vector<std::shared_ptr<Command>>>
+			categories;
+
+		bot.commands().get_commands(
+			[&](const boost::unordered_flat_map<
+				std::string, std::shared_ptr<Command>> &commands) {
+				for (const auto &[_, command] : commands) {
+					categories[command->options.category].push_back(command);
+				}
+			});
+
+		auto builder = ekizu::EmbedBuilder()
+						   .set_title("📚 Help")
+						   .set_description("Available command categories:")
+						   .set_color(util::k_color_ok);
+
+		for (const auto &[category, cmds] : categories) {
+			std::string emoji = "❓";
+			if (CATEGORY_EMOJIS.contains(category)) {
+				emoji = std::string{CATEGORY_EMOJIS.at(category)};
+			}
+
+			std::string cmd_list;
+			for (const auto &cmd : cmds) {
+				if (!cmd_list.empty()) { cmd_list += ", "; }
+				cmd_list += fmt::format("`{}`", cmd->options.name);
+			}
+
+			builder.add_field(ekizu::EmbedField{
+				fmt::format("{} {}", emoji, category),
+				cmd_list.empty() ? "No commands" : cmd_list, false});
+		}
+
+		builder.set_footer({"Use /help <command> for detailed info"});
+
+		SABER_TRY(bot.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .embeds({builder.build()})
+							  .build())
+					  .send(yield));
+
+		return outcome::success();
+	}
+
+	Result<> get_command_help_interaction(
+		const ekizu::Interaction &interaction, const std::string &command,
+		const boost::asio::yield_context &yield) {
+		std::optional<ekizu::Embed> embed;
+
+		bot.commands().get_commands(
+			[&, this](const boost::unordered_flat_map<
+					  std::string, std::shared_ptr<Command>> &commands) {
+				if (!commands.contains(command)) { return; }
+
+				const auto &cmd = commands.at(command);
+				auto builder =
+					ekizu::EmbedBuilder{}.set_title(cmd->options.name);
+
+				if (!cmd->options.description.empty()) {
+					builder.set_description(cmd->options.description);
+				}
+
+				if (!cmd->options.examples.empty()) {
+					builder.add_field(
+						{"❯ Examples",
+						 boost::algorithm::join(
+							 cmd->options.examples |
+								 boost::adaptors::transformed(
+									 [this](const auto &example) {
+										 return fmt::format("`/{}`\n", example);
+									 }),
+							 "")});
+				}
+
+				if (!cmd->options.usage.empty()) {
+					builder.add_field(
+						{"❯ Usage", fmt::format("`/{}`", cmd->options.usage)});
+				}
+
+				if (!cmd->options.aliases.empty()) {
+					builder.add_field(
+						{"❯ Aliases",
+						 boost::algorithm::join(
+							 cmd->options.aliases |
+								 boost::adaptors::transformed(
+									 [](const auto &alias) {
+										 return fmt::format("`{}`", alias);
+									 }),
+							 " | ")});
+				}
+
+				builder.add_field(
+					{"❯ Cooldown",
+					 fmt::format(
+						 "{}ms",
+						 std::chrono::duration_cast<std::chrono::milliseconds>(
+							 cmd->options.cooldown)
+							 .count())});
+
+				embed = builder.build();
+			});
+
+		if (!embed) {
+			SABER_TRY(bot.http()
+						  .interaction(interaction.application_id)
+						  .create_response(
+							  interaction.id, interaction.token,
+							  ekizu::InteractionResponseBuilder()
+								  .type(ekizu::InteractionResponseType::
+											ChannelMessageWithSource)
+								  .content(fmt::format(
+									  "Command `{}` not found.", command))
+								  .build())
+						  .send(yield));
+			return outcome::success();
+		}
+
+		SABER_TRY(bot.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .embeds({*embed})
+							  .build())
+					  .send(yield));
+
+		return outcome::success();
 	}
 
 	Result<> get_help(const ekizu::Message &message,

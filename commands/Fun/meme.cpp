@@ -17,15 +17,51 @@ struct Meme : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
 					 [[maybe_unused]] const std::vector<std::string> &args,
 					 const boost::asio::yield_context &yield) override {
-		return fetch_meme(message, yield);
+		return fetch_meme(
+			[&](ekizu::Embed embed) -> Result<> {
+				SABER_TRY(bot.http()
+							  .create_message(message.channel_id)
+							  .embeds({std::move(embed)})
+							  .send(yield));
+				return outcome::success();
+			},
+			yield);
 	}
 
-	Result<> fetch_meme(const ekizu::Message &message,
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		// Defer response since API call can take time
+		SABER_TRY(
+			bot.http()
+				.interaction(interaction.application_id)
+				.create_response(interaction.id, interaction.token,
+								 ekizu::InteractionResponseBuilder()
+									 .type(ekizu::InteractionResponseType::
+											   DeferredChannelMessageWithSource)
+									 .build())
+				.send(yield));
+
+		return fetch_meme(
+			[&](ekizu::Embed embed) -> Result<> {
+				SABER_TRY(bot.http()
+							  .interaction(interaction.application_id)
+							  .edit_original_response(interaction.token)
+							  .embeds({std::move(embed)})
+							  .send(yield));
+				return outcome::success();
+			},
+			yield);
+	}
+
+   private:
+	template <typename SendEmbed>
+	Result<> fetch_meme(SendEmbed send_embed,
 						const boost::asio::yield_context &yield) const {
 		auto res = ekizu::net::HttpConnection::get(
 			bot.http().get_executor(), "https://meme-api.com/gimme", yield);
@@ -50,11 +86,7 @@ struct Meme : Command {
 				})
 				.build();
 
-		SABER_TRY(bot.http()
-					  .create_message(message.channel_id)
-					  .embeds({std::move(embed)})
-					  .send(yield));
-
+		SABER_TRY(send_embed(std::move(embed)));
 		return outcome::success();
 	}
 };

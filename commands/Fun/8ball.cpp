@@ -17,6 +17,13 @@ struct Eightball : Command {
 				  .bot_permissions(ekizu::Permissions::SendMessages |
 								   ekizu::Permissions::EmbedLinks)
 				  .cooldown(std::chrono::seconds(3))
+				  .slash_options(
+					  {ekizu::ApplicationCommandOptionBuilder()
+						   .type(ekizu::ApplicationCommandOptionType::String)
+						   .name("question")
+						   .description("Your question for the 8-ball")
+						   .required(true)
+						   .build()})
 				  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -30,18 +37,52 @@ struct Eightball : Command {
 			return outcome::success();
 		}
 
-		// Otherwise, pick a random response and send it
-		/// Use random engine.
 		SABER_TRY(bot.http()
 					  .create_message(message.channel_id)
-					  .content(responses[util::get_random_number<size_t>(
-						  0, responses.size() - 1)])
+					  .content(get_response())
+					  .send(yield));
+
+		return outcome::success();
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		auto question = util::get_option<std::string>(interaction, "question");
+		if (!question) {
+			SABER_TRY(bot.http()
+						  .interaction(interaction.application_id)
+						  .create_response(
+							  interaction.id, interaction.token,
+							  ekizu::InteractionResponseBuilder()
+								  .type(ekizu::InteractionResponseType::
+											ChannelMessageWithSource)
+								  .content("You need to ask a question!")
+								  .build())
+						  .send(yield));
+			return outcome::success();
+		}
+
+		SABER_TRY(bot.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .content(fmt::format(
+								  "🎱 **{}**\n{}", *question, get_response()))
+							  .build())
 					  .send(yield));
 
 		return outcome::success();
 	}
 
    private:
+	std::string get_response() {
+		return responses[util::get_random_number<size_t>(
+			0, responses.size() - 1)];
+	}
+
 	std::vector<std::string> responses{
 		"It is certain.",
 		"It is decidedly so.",

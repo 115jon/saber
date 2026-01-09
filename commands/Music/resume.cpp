@@ -15,6 +15,7 @@ struct Resume : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})  // No options needed
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -27,6 +28,31 @@ struct Resume : Command {
 		SABER_TRY(bot.player().resume(*message.guild_id));
 		SABER_TRY(bot.http()
 					  .create_reaction(message.channel_id, message.id, "▶")
+					  .send(yield));
+		return outcome::success();
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		if (!interaction.guild_id) {
+			return boost::system::errc::operation_not_permitted;
+		}
+
+		SABER_TRY(
+			auto voice_state, util::in_voice_channel(bot, interaction, yield));
+		SABER_TRY(bot.player().connect(
+			*interaction.guild_id, *voice_state->channel_id, yield));
+		SABER_TRY(bot.player().resume(*interaction.guild_id));
+
+		SABER_TRY(bot.http()
+					  .interaction(interaction.application_id)
+					  .create_response(
+						  interaction.id, interaction.token,
+						  ekizu::InteractionResponseBuilder()
+							  .type(ekizu::InteractionResponseType::
+										ChannelMessageWithSource)
+							  .content("▶️ Resumed")
+							  .build())
 					  .send(yield));
 		return outcome::success();
 	}

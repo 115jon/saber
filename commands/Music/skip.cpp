@@ -19,14 +19,14 @@ struct Skip : Command {
 				  .bot_permissions(ekizu::Permissions::SendMessages |
 								   ekizu::Permissions::EmbedLinks)
 				  .cooldown(std::chrono::seconds(3))
-				  .slash_options({ekizu::ApplicationCommandOption{
-					  ekizu::ApplicationCommandOptionType::Integer,
-					  "track_id",
-					  {},
-					  "Jump to a specific track by its queue ID",
-					  {},
-					  false,  // not required
-				  }})
+				  .slash_options(
+					  {ekizu::ApplicationCommandOptionBuilder()
+						   .type(ekizu::ApplicationCommandOptionType::Integer)
+						   .name("track_id")
+						   .description(
+							   "Jump to a specific track by its queue ID")
+						   .required(false)
+						   .build()})
 				  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -69,33 +69,11 @@ struct Skip : Command {
 		SABER_TRY(bot.player().connect(
 			*interaction.guild_id, *voice_state->channel_id, yield));
 
-		// Extract track_id from interaction options
-		std::optional<uint64_t> track_id;
-		if (interaction.data) {
-			const auto *cmd_data =
-				std::get_if<ekizu::ApplicationCommandData>(&*interaction.data);
-			if (cmd_data) {
-				for (const auto &opt : cmd_data->options) {
-					if (opt.name == "track_id" && opt.value) {
-						if (const auto *val =
-								std::get_if<int64_t>(&*opt.value)) {
-							track_id = static_cast<uint64_t>(*val);
-						}
-					}
-				}
-			}
-		}
+		// Extract options using helpers
+		auto track_id = util::get_int_option<uint64_t>(interaction, "track_id");
+		auto username = util::get_username(interaction);
 
-		// Get user name for footer
-		std::string username = "Unknown";
-		if (interaction.member) {
-			username = interaction.member->user.username;
-		} else if (interaction.user) {
-			username = interaction.user->username;
-		}
-
-		// For slash commands, we'll just create a regular message response
-		// since edit_original_response may not be available
+		// Slash command response
 		auto send_embed = [&](ekizu::Embed embed) -> Result<> {
 			SABER_TRY(bot.http()
 						  .interaction(interaction.application_id)

@@ -16,6 +16,7 @@ struct Shuffle : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})  // No options needed
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -25,74 +26,92 @@ struct Shuffle : Command {
 			auto voice_state, util::in_voice_channel(bot, message, yield));
 		SABER_TRY(bot.player().connect(
 			*message.guild_id, *voice_state->channel_id, yield));
-		SABER_TRY(auto queue, bot.player().queue(*message.guild_id));
 
-		const auto footer =
-			fmt::format("Requested by {}", message.author.username);
-
-		auto send_v2 = [&](uint32_t accent_color, std::string title,
-						   std::string desc) -> Result<> {
-			const auto now_playing = util::now_playing_line(
-				queue ? queue->tracks : std::deque<Track>{},
-				queue ? queue->current_track_id : std::optional<uint64_t>{});
-
-			const auto up_next = util::up_next_line(
-				queue ? queue->tracks : std::deque<Track>{},
-				queue ? queue->current_track_id : std::optional<uint64_t>{});
-
-			ekizu::Container container =
-				ekizu::ContainerBuilder()
-					.accent_color(accent_color)
-					.add(ekizu::TextDisplayBuilder()
-							 .content(fmt::format("### {}", title))
-							 .build())
-					.add(ekizu::TextDisplayBuilder()
-							 .content(std::move(desc))
-							 .build())
-					.add(ekizu::SeparatorBuilder()
-							 .divider(true)
-							 .spacing(1)
-							 .build())
-					.add(ekizu::TextDisplayBuilder()
-							 .content(now_playing)
-							 .build())
-					.add(ekizu::TextDisplayBuilder().content(up_next).build())
-					.add(ekizu::SeparatorBuilder()
-							 .divider(true)
-							 .spacing(1)
-							 .build())
-					.add(ekizu::TextDisplayBuilder().content(footer).build())
-					.build();
-
-			std::vector<ekizu::MessageComponent> components;
-			components.emplace_back(std::move(container));
-
+		auto send_embed = [&](ekizu::Embed embed) -> Result<> {
 			SABER_TRY(bot.http()
 						  .create_message(message.channel_id)
-						  .flags(ekizu::MessageFlags::IsComponentsV2)
-						  .components(std::move(components))
+						  .embeds({std::move(embed)})
 						  .reply(message.id)
 						  .send(yield));
-
 			return outcome::success();
 		};
 
-		// Allow shuffle even if nothing is currently playing; only fail when
-		// there is nothing meaningful to shuffle.
-		if ((queue == nullptr) || queue->tracks.empty()) {
-			return send_v2(util::k_color_warn, "Nothing to shuffle",
-						   "There are no tracks in this server’s queue.");
+		return do_shuffle(
+			*message.guild_id, message.author.username, send_embed, yield);
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		if (!interaction.guild_id) {
+			return boost::system::errc::operation_not_permitted;
 		}
 
-		SABER_TRY(auto ok, bot.player().shuffle(*message.guild_id));
+		SABER_TRY(
+			auto voice_state, util::in_voice_channel(bot, interaction, yield));
+		SABER_TRY(bot.player().connect(
+			*interaction.guild_id, *voice_state->channel_id, yield));
+
+		auto username = util::get_username(interaction);
+
+		auto send_embed = [&](ekizu::Embed embed) -> Result<> {
+			SABER_TRY(bot.http()
+						  .interaction(interaction.application_id)
+						  .create_response(
+							  interaction.id, interaction.token,
+							  ekizu::InteractionResponseBuilder()
+								  .type(ekizu::InteractionResponseType::
+											ChannelMessageWithSource)
+								  .embeds({std::move(embed)})
+								  .build())
+						  .send(yield));
+			return outcome::success();
+		};
+
+		return do_shuffle(*interaction.guild_id, username, send_embed, yield);
+	}
+
+   private:
+	template <typename SendEmbed>
+	Result<> do_shuffle(
+		ekizu::Snowflake guild_id, const std::string &username,
+		SendEmbed send_embed,
+		[[maybe_unused]] const boost::asio::yield_context &yield) {
+		SABER_TRY(auto queue, bot.player().queue(guild_id));
+
+		const auto footer = fmt::format("Requested by {}", username);
+
+		if (!queue || queue->tracks.empty()) {
+			auto embed = util::music_action_embed(
+				"Nothing to shuffle", util::k_color_warn,
+				"There are no tracks in this server's queue.",
+				util::now_playing_line(
+					queue ? queue->tracks : std::deque<Track>{},
+					queue ? queue->current_track_id
+						  : std::optional<uint64_t>{}),
+				util::up_next_line(queue ? queue->tracks : std::deque<Track>{},
+								   queue ? queue->current_track_id
+										 : std::optional<uint64_t>{}),
+				footer);
+			return send_embed(std::move(embed));
+		}
+
+		SABER_TRY(auto ok, bot.player().shuffle(guild_id));
 		if (!ok) {
-			return send_v2(
-				util::k_color_warn, "Nothing to shuffle",
-				"Not enough tracks to shuffle (try adding more tracks first).");
+			auto embed = util::music_action_embed(
+				"Nothing to shuffle", util::k_color_warn,
+				"Not enough tracks to shuffle (try adding more tracks first).",
+				util::now_playing_line(queue->tracks, queue->current_track_id),
+				util::up_next_line(queue->tracks, queue->current_track_id),
+				footer);
+			return send_embed(std::move(embed));
 		}
 
-		return send_v2(util::k_color_ok, "Queue shuffled",
-					   "Randomized the up-next tracks in the queue.");
+		auto embed = util::music_action_embed(
+			"Queue shuffled", util::k_color_ok,
+			"Randomized the up-next tracks in the queue.",
+			util::now_playing_line(queue->tracks, queue->current_track_id),
+			util::up_next_line(queue->tracks, queue->current_track_id), footer);
+		return send_embed(std::move(embed));
 	}
 };
 

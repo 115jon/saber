@@ -13,7 +13,7 @@
     {
       "kind": "git",
       "repository": "https://github.com/115jon/vcpkg-registry",
-      "baseline": "7acc562e6f3c5342b91e2fc672e4803ca87d4fa0",
+      "baseline": "6a40c73af71ebe78495ca52b26bbd9a22cec39b3",
       "packages": [
         "certify",
         "ekizu",

@@ -1,5 +1,6 @@
 #include <nlohmann/json.hpp>
 #include <saber/saber.hpp>
+#include <saber/util.hpp>
 
 using namespace saber;
 
@@ -13,30 +14,62 @@ struct XKCD : Command {
 					  .category(DIRNAME)
 					  .enabled(true)
 					  .usage("xkcd")
+					  .description("Shows the latest XKCD comic.")
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
+					  .slash_options({})
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
-					 const std::vector<std::string> &args,
+					 [[maybe_unused]] const std::vector<std::string> &args,
 					 const boost::asio::yield_context &yield) override {
-		return fetchXKCD(message, args, yield);
+		return fetch_xkcd(
+			[&](std::string content) -> Result<> {
+				SABER_TRY(bot.http()
+							  .create_message(message.channel_id)
+							  .content(std::move(content))
+							  .send(yield));
+				return outcome::success();
+			},
+			yield);
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		// Defer response since API call can take time
+		SABER_TRY(
+			bot.http()
+				.interaction(interaction.application_id)
+				.create_response(interaction.id, interaction.token,
+								 ekizu::InteractionResponseBuilder()
+									 .type(ekizu::InteractionResponseType::
+											   DeferredChannelMessageWithSource)
+									 .build())
+				.send(yield));
+
+		return fetch_xkcd(
+			[&](std::string content) -> Result<> {
+				SABER_TRY(bot.http()
+							  .interaction(interaction.application_id)
+							  .edit_original_response(interaction.token)
+							  .content(std::move(content))
+							  .send(yield));
+				return outcome::success();
+			},
+			yield);
 	}
 
    private:
-	Result<> fetchXKCD(const ekizu::Message &message,
-					   [[maybe_unused]] const std::vector<std::string> &args,
-					   const boost::asio::yield_context &yield) {
+	template <typename SendReply>
+	Result<> fetch_xkcd(SendReply send_reply,
+						const boost::asio::yield_context &yield) {
 		auto res = ekizu::net::HttpConnection::get(
 			bot.http().get_executor(), api_url, yield);
 
 		if (!res || res.value().result_int() != 200) {
 			bot.log<ekizu::LogLevel::Error>("Error while fetching XKCD data");
-			(void)bot.http()
-				.create_message(message.channel_id)
-				.content("There was an error. Please try again.")
-				.send(yield);
-			return boost::system::errc::operation_not_permitted;
+			SABER_TRY(send_reply("There was an error. Please try again."));
+			return outcome::success();
 		}
 
 		const auto json =
@@ -44,11 +77,8 @@ struct XKCD : Command {
 
 		if (json.is_discarded() || !json.is_object()) {
 			bot.log<ekizu::LogLevel::Error>("Error parsing XKCD data");
-			SABER_TRY(bot.http()
-						  .create_message(message.channel_id)
-						  .content("There was an error. Please try again.")
-						  .send(yield));
-			return boost::system::errc::invalid_argument;
+			SABER_TRY(send_reply("There was an error. Please try again."));
+			return outcome::success();
 		}
 
 		const auto comic_url =
@@ -59,11 +89,7 @@ struct XKCD : Command {
 			json["img"].get<std::string>(), json["alt"].get<std::string>(),
 			comic_url);
 
-		SABER_TRY(bot.http()
-					  .create_message(message.channel_id)
-					  .content(msg)
-					  .send(yield));
-
+		SABER_TRY(send_reply(msg));
 		return outcome::success();
 	}
 };

@@ -246,4 +246,45 @@ std::string format_duration(uint64_t duration) {
 	return fmt::format("{:02}:{:02}", minutes, seconds);
 }
 
+// ---------------------------------------------------------------------------
+// Interaction helpers
+// ---------------------------------------------------------------------------
+
+std::string get_username(const ekizu::Interaction &interaction) {
+	if (interaction.member) { return interaction.member->user.username; }
+	if (interaction.user) { return interaction.user->username; }
+	return "Unknown";
+}
+
+std::optional<ekizu::Snowflake> get_user_id(
+	const ekizu::Interaction &interaction) {
+	if (interaction.member) { return interaction.member->user.id; }
+	if (interaction.user) { return interaction.user->id; }
+	return std::nullopt;
+}
+
+std::optional<ekizu::Snowflake> get_channel_id(
+	const ekizu::Interaction &interaction) {
+	if (interaction.channel_id) { return interaction.channel_id; }
+	if (interaction.channel) { return interaction.channel->id; }
+	return std::nullopt;
+}
+
+const ekizu::ApplicationCommandData *get_command_data(
+	const ekizu::Interaction &interaction) {
+	if (!interaction.data) { return nullptr; }
+
+	const ekizu::ApplicationCommandData *result = nullptr;
+	std::visit(
+		[&result](const auto &d) {
+			using T = std::decay_t<decltype(d)>;
+			if constexpr (std::is_same_v<T, ekizu::ApplicationCommandData>) {
+				result = &d;
+			}
+		},
+		*interaction.data);
+
+	return result;
+}
+
 }  // namespace saber::util

@@ -15,6 +15,7 @@ struct Previous : Command {
 					  .bot_permissions(ekizu::Permissions::SendMessages |
 									   ekizu::Permissions::EmbedLinks)
 					  .cooldown(std::chrono::seconds(3))
+					  .slash_options({})  // No options needed
 					  .build()) {}
 
 	Result<> execute(const ekizu::Message &message,
@@ -24,10 +25,59 @@ struct Previous : Command {
 			auto voice_state, util::in_voice_channel(bot, message, yield));
 		SABER_TRY(bot.player().connect(
 			*message.guild_id, *voice_state->channel_id, yield));
-		SABER_TRY(auto queue, bot.player().queue(*message.guild_id));
 
-		const auto footer =
-			fmt::format("Requested by {}", message.author.username);
+		auto send_embed = [&](ekizu::Embed embed) -> Result<> {
+			SABER_TRY(bot.http()
+						  .create_message(message.channel_id)
+						  .embeds({std::move(embed)})
+						  .reply(message.id)
+						  .send(yield));
+			return outcome::success();
+		};
+
+		return do_previous(
+			*message.guild_id, message.author.username, send_embed, yield);
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		if (!interaction.guild_id) {
+			return boost::system::errc::operation_not_permitted;
+		}
+
+		SABER_TRY(
+			auto voice_state, util::in_voice_channel(bot, interaction, yield));
+		SABER_TRY(bot.player().connect(
+			*interaction.guild_id, *voice_state->channel_id, yield));
+
+		auto username = util::get_username(interaction);
+
+		auto send_embed = [&](ekizu::Embed embed) -> Result<> {
+			SABER_TRY(bot.http()
+						  .interaction(interaction.application_id)
+						  .create_response(
+							  interaction.id, interaction.token,
+							  ekizu::InteractionResponseBuilder()
+								  .type(ekizu::InteractionResponseType::
+											ChannelMessageWithSource)
+								  .embeds({std::move(embed)})
+								  .build())
+						  .send(yield));
+			return outcome::success();
+		};
+
+		return do_previous(*interaction.guild_id, username, send_embed, yield);
+	}
+
+   private:
+	template <typename SendEmbed>
+	Result<> do_previous(
+		ekizu::Snowflake guild_id, const std::string &username,
+		SendEmbed send_embed,
+		[[maybe_unused]] const boost::asio::yield_context &yield) {
+		SABER_TRY(auto queue, bot.player().queue(guild_id));
+
+		const auto footer = fmt::format("Requested by {}", username);
 
 		if (!queue || queue->tracks.empty() || !queue->current_track_id) {
 			auto embed = util::music_action_embed(
@@ -41,32 +91,20 @@ struct Previous : Command {
 								   queue ? queue->current_track_id
 										 : std::optional<uint64_t>{}),
 				footer);
-
-			SABER_TRY(bot.http()
-						  .create_message(message.channel_id)
-						  .embeds({std::move(embed)})
-						  .reply(message.id)
-						  .send(yield));
-			return outcome::success();
+			return send_embed(std::move(embed));
 		}
 
 		const auto before_id = queue->current_track_id;
 
-		SABER_TRY(auto ok, bot.player().previous(*message.guild_id));
+		SABER_TRY(auto ok, bot.player().previous(guild_id));
 		if (!ok) {
 			auto embed = util::music_action_embed(
 				"No previous track", util::k_color_warn,
-				"There isn’t a previous track in the queue.",
+				"There isn't a previous track in the queue.",
 				util::now_playing_line(queue->tracks, queue->current_track_id),
 				util::up_next_line(queue->tracks, queue->current_track_id),
 				footer);
-
-			SABER_TRY(bot.http()
-						  .create_message(message.channel_id)
-						  .embeds({std::move(embed)})
-						  .reply(message.id)
-						  .send(yield));
-			return outcome::success();
+			return send_embed(std::move(embed));
 		}
 
 		const auto after_id = queue->current_track_id;
@@ -78,14 +116,7 @@ struct Previous : Command {
 					  : "Moved to the previous track in the queue.",
 			util::now_playing_line(queue->tracks, queue->current_track_id),
 			util::up_next_line(queue->tracks, queue->current_track_id), footer);
-
-		SABER_TRY(bot.http()
-					  .create_message(message.channel_id)
-					  .embeds({std::move(embed)})
-					  .reply(message.id)
-					  .send(yield));
-
-		return outcome::success();
+		return send_embed(std::move(embed));
 	}
 };
 

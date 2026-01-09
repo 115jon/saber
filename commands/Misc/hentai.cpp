@@ -10,16 +10,26 @@ using namespace saber;
 
 struct Hentai : Command {
 	explicit Hentai(Saber &creator)
-		: Command(creator,
-				  CommandOptionsBuilder()
-					  .name("hentai")
-					  .category(DIRNAME)
-					  .enabled(true)
-					  .init(true)
-					  .bot_permissions(ekizu::Permissions::SendMessages |
-									   ekizu::Permissions::EmbedLinks)
-					  .cooldown(std::chrono::seconds(2))
-					  .build()),
+		: Command(
+			  creator,
+			  CommandOptionsBuilder()
+				  .name("hentai")
+				  .category(DIRNAME)
+				  .enabled(true)
+				  .init(true)
+				  .usage("hentai <query>")
+				  .description("Search for artwork on Reddit.")
+				  .bot_permissions(ekizu::Permissions::SendMessages |
+								   ekizu::Permissions::EmbedLinks)
+				  .cooldown(std::chrono::seconds(2))
+				  .slash_options(
+					  {ekizu::ApplicationCommandOptionBuilder()
+						   .type(ekizu::ApplicationCommandOptionType::String)
+						   .name("query")
+						   .description("Search query")
+						   .required(true)
+						   .build()})
+				  .build()),
 		  m_reddit{creator.http().get_executor(),
 				   RedditOptions{
 					   std::getenv("SABER_REDDIT_USERNAME"),
@@ -42,21 +52,75 @@ struct Hentai : Command {
 		}
 
 		const auto query = fmt::to_string(fmt::join(args, " "));
-		SABER_TRY(const auto sauce, search_hentai_subreddit(query, yield));
-		auto cm =
-			bot.http().create_message(message.channel_id).reply(message.id);
 
-		if (sauce.empty()) {
-			SABER_TRY(cm.content("No results found.").send(yield));
+		return do_search(
+			query,
+			[&](std::string content) {
+				return bot.http()
+					.create_message(message.channel_id)
+					.content(std::move(content))
+					.reply(message.id)
+					.send(yield);
+			},
+			yield);
+	}
+
+	Result<> execute(const ekizu::Interaction &interaction,
+					 const boost::asio::yield_context &yield) override {
+		auto query = util::get_option<std::string>(interaction, "query");
+		if (!query) {
+			SABER_TRY(bot.http()
+						  .interaction(interaction.application_id)
+						  .create_response(
+							  interaction.id, interaction.token,
+							  ekizu::InteractionResponseBuilder()
+								  .type(ekizu::InteractionResponseType::
+											ChannelMessageWithSource)
+								  .content("Please specify a query.")
+								  .build())
+						  .send(yield));
 			return outcome::success();
 		}
 
-		SABER_TRY(cm.content(sauce).send(yield));
+		// Defer response since Reddit API calls can take time
+		SABER_TRY(
+			bot.http()
+				.interaction(interaction.application_id)
+				.create_response(interaction.id, interaction.token,
+								 ekizu::InteractionResponseBuilder()
+									 .type(ekizu::InteractionResponseType::
+											   DeferredChannelMessageWithSource)
+									 .build())
+				.send(yield));
 
-		return outcome::success();
+		return do_search(
+			*query,
+			[&](std::string content) -> Result<> {
+				SABER_TRY(bot.http()
+							  .interaction(interaction.application_id)
+							  .edit_original_response(interaction.token)
+							  .content(std::move(content))
+							  .send(yield));
+				return outcome::success();
+			},
+			yield);
 	}
 
    private:
+	template <typename SendReply>
+	Result<> do_search(const std::string &query, SendReply send_reply,
+					   const boost::asio::yield_context &yield) {
+		SABER_TRY(const auto sauce, search_hentai_subreddit(query, yield));
+
+		if (sauce.empty()) {
+			SABER_TRY(send_reply("No results found."));
+			return outcome::success();
+		}
+
+		SABER_TRY(send_reply(sauce));
+		return outcome::success();
+	}
+
 	Result<std::string> search_hentai_subreddit(
 		std::string_view query, const boost::asio::yield_context &yield) {
 		SABER_TRY(
